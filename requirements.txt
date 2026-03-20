@@ -1,0 +1,19 @@
+# UI
+PySide6
+
+# Database
+SQLAlchemy
+psycopg2-binary
+
+# Data processing
+pandas
+
+# Reports
+openpyxl
+python-docx
+
+# Recommended build command:
+# pyinstaller --noconfirm --clean HLA_Laboratory_System.spec
+pyinstaller
+
+# Версию приложения обновлять в версию LICENSE.txt, COPYRIGHT.txt, THIRD_PARTY_LICENSES.txt, version_info.txt и README.md;
