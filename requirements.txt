@@ -1,0 +1,20 @@
+# pip install --upgrade --upgrade-strategy eager -r requirements.txt
+
+# UI
+PySide6
+
+# Database
+SQLAlchemy
+psycopg2-binary
+
+# Data processing
+pandas
+
+# Reports
+openpyxl
+python-docx
+pywin32
+
+# Recommended build command:
+# .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --noupx --icon assets\app.ico --version-file version_info.txt --add-data "assets;assets" --add-data "licenses;licenses" --add-data "Scripts;Scripts" --add-data "THIRD_PARTY_LICENSES.txt;." --add-data "LICENSE.txt;." --add-data "COPYRIGHT.txt;." --add-data "AUTHORS.md;." --add-data "README.md;." --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32com.client --name HLA_Laboratory_System main.py
+pyinstaller

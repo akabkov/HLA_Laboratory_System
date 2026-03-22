@@ -1,0 +1,20 @@
+pywin32 licensing note
+======================
+
+This project uses pywin32 for Windows COM integration when converting
+Word conclusion files (`.doc` / `.docx`) to PDF during import.
+
+Public metadata currently published for pywin32:
+- PyPI project page: https://pypi.org/project/pywin32/
+- Declared license on PyPI: Python Software Foundation License (PSF)
+- Upstream source repository: https://github.com/mhammond/pywin32
+
+Important release note
+----------------------
+Before preparing a redistributable release bundle of this application,
+verify the exact license text and notices that correspond to the pywin32
+wheel/source tree actually used for that release, and replace or supplement
+this note with the authoritative upstream license file if required.
+
+Microsoft Word itself is not redistributed as part of this application.
+Its installation and use remain subject to Microsoft's separate license terms.

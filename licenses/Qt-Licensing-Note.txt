@@ -1,0 +1,42 @@
+Qt / PySide6 licensing note
+
+Your application uses PySide6 (Qt for Python).
+
+Current build environment reviewed for this project:
+- PySide6 6.10.2
+- PySide6_Essentials 6.10.2
+- PySide6_Addons 6.10.2
+- shiboken6 6.10.2
+
+Installed wheel metadata for these packages declares:
+- LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+
+This project is intended to be distributed under the LGPLv3 route for Qt for
+Python, unless a specific release is built and distributed under a separate
+commercial Qt license.
+
+For final distribution of your application, bundle:
+1. the applicable Qt open-source license text(s) you rely on;
+2. the exact license/notice files that are shipped with the specific PySide6
+   wheel used to build the release;
+3. this project's THIRD_PARTY_LICENSES.txt file.
+
+Why this note exists:
+Qt for Python documentation states that Qt for Python includes code under LGPL or
+commercial terms and also includes code under other specific licenses, and recommends
+that programs using Qt for Python acknowledge those contributions and quote the
+relevant license statements in an appendix or documentation.
+
+Practical step:
+After installing PySide6 in your build environment, inspect the package contents and
+copy the included license/notice files from that installation into your shipped bundle.
+
+This repository includes:
+- licenses/LGPL-3.0.txt
+- licenses/GPL-2.0.txt
+- licenses/GPL-3.0.txt
+- licenses/Qt-Commercial-Reference.txt
+
+The file Qt-Commercial-Reference.txt is copied from the installed wheel metadata
+as an exact upstream reference file. Its presence does not, by itself, mean that
+this project is distributed under a commercial Qt license.
