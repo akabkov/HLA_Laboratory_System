@@ -13,6 +13,15 @@ import time
 from multiprocessing import freeze_support
 from pathlib import Path
 
+from hla_app.services.conclusion_pdf_conversion import (
+    run_word_document_to_pdf_helper_from_argv,
+)
+from hla_app.services.runtime_diagnostics import (
+    initialize_runtime_diagnostics,
+    log_runtime_event,
+    log_runtime_exception,
+)
+
 # Служебный аргумент для фонового режима очистки временного файла.
 _TEMP_FILE_CLEANUP_ARG = "--cleanup-temp-file"
 _ALLOWED_TEMP_FILE_PREFIX = "__hla_print__"
@@ -69,6 +78,8 @@ def _run_temp_file_cleanup_from_argv(argv: list[str]) -> int | None:
 def main() -> None:
     freeze_support()
 
+    diagnostics = initialize_runtime_diagnostics()
+
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -81,6 +92,8 @@ def main() -> None:
     from hla_app.ui.startup_splash import StartupSplash
 
     app = QApplication(sys.argv)
+    diagnostics.install_qt_message_handler()
+    log_runtime_event("info", "QApplication создан.")
 
     # --- Ресурсы интерфейса и splash-экран ---
     icon_path = Path(__file__).resolve().parent / "assets" / "app.ico"
@@ -106,6 +119,7 @@ def main() -> None:
         )
 
         install_qt_translators(app)
+        log_runtime_event("info", "Qt translator-ы установлены.")
         splash.set_step(
             15,
             "Загрузка локализации...",
@@ -223,6 +237,7 @@ def main() -> None:
         from hla_app.ui.main_window import MainWindow
 
         window = MainWindow(root_dir_available=root_dir_error is None)
+        log_runtime_event("info", "Главное окно MainWindow инициализировано.")
 
         wanted = window.calculate_initial_size()
         screen = splash.screen()
@@ -273,10 +288,25 @@ def main() -> None:
                 f"{db_connection_error}",
             )
 
-        sys.exit(app.exec())
+        previous_shutdown_message = (
+            diagnostics.build_previous_unexpected_shutdown_message()
+        )
+        if previous_shutdown_message:
+            QMessageBox.warning(
+                window,
+                "Обнаружено предыдущее аварийное завершение",
+                previous_shutdown_message,
+            )
+
+        log_runtime_event("info", "Переход в основной цикл Qt.")
+        exit_code = app.exec()
+        log_runtime_event("info", f"Qt event loop завершен с кодом {exit_code}.")
+        diagnostics.mark_clean_shutdown()
+        sys.exit(exit_code)
 
     except Exception as exc:
         # --- Фатальная ошибка старта ---
+        log_runtime_exception("Фатальная ошибка запуска приложения.", exc)
         splash.set_step(
             100,
             "Ошибка запуска",
@@ -289,6 +319,7 @@ def main() -> None:
             f"Приложение не удалось запустить:\n\n{exc}",
         )
         splash.close()
+        diagnostics.mark_clean_shutdown()
         sys.exit(1)
 
 
@@ -296,5 +327,9 @@ if __name__ == "__main__":
     cleanup_exit_code = _run_temp_file_cleanup_from_argv(sys.argv)
     if cleanup_exit_code is not None:
         sys.exit(cleanup_exit_code)
+
+    word_helper_exit_code = run_word_document_to_pdf_helper_from_argv(sys.argv)
+    if word_helper_exit_code is not None:
+        sys.exit(word_helper_exit_code)
 
     main()

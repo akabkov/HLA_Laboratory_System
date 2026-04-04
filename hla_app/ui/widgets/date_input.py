@@ -149,7 +149,6 @@ class DateInput(QWidget):
         self.min_date = min_date
         self.max_date = max_date
         self.default_date = default
-        self.required_year_prefix = required_year_prefix
         self._calendar_popup = None
 
         self.dd = QLineEdit()

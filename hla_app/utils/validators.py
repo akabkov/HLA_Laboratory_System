@@ -70,6 +70,11 @@ def normalize_for_compare(s: str) -> str:
     return (s or "").replace("Ё", "Е").replace("ё", "е").lower()
 
 
+def is_positive_int_text_without_leading_zero(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.fullmatch(r"[1-9]\d*", s))
+
+
 def normalize_for_match(s: str, *, strict_first_char: bool = False) -> str:
     """
     Фаззи-нормализация для поиска совпадений:
@@ -110,7 +115,7 @@ def normalize_for_match(s: str, *, strict_first_char: bool = False) -> str:
 
         return result
 
-    # старая логика целиком
+    # Нестрогий режим: фаззи-правила применяются ко всей строке.
     for a, b in _EQUIV_MULTI:
         s = s.replace(a, b)
 

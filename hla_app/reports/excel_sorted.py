@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,12 +26,16 @@ from hla_app.reports.excel_common import (
 )
 from hla_app.storage.fs_ops import delete_file, replace_file
 from hla_app.utils.patient_name import format_patient_short_name
+from hla_app.utils.validators import format_ddmmyyyy
 
 # --- Публичная генерация стандартного Excel-результата исследования ---
 
 
-def create_sorted_excel_result(csv_file: Path, output_path: Path) -> Path:
-    hla_class, batch_date, patient, pra, antibodies = parse_fixed_luminex_csv(csv_file)
+def create_sorted_excel_result(
+    csv_file: Path, output_path: Path, test_date: date
+) -> Path:
+    hla_class, _batch_date, patient, pra, antibodies = parse_fixed_luminex_csv(csv_file)
+    report_date = format_ddmmyyyy(test_date)
 
     patient_norm = format_patient_short_name(patient)
 
@@ -78,7 +83,7 @@ def create_sorted_excel_result(csv_file: Path, output_path: Path) -> Path:
         sheet["B1"].font = bold
 
         sheet.merge_cells("B2:C2")
-        sheet["B2"] = f"Date: {batch_date}"
+        sheet["B2"] = f"Date: {report_date}"
         sheet["B2"].alignment = center
         sheet["B2"].font = bold
 

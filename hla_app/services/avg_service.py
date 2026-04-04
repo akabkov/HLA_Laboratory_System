@@ -9,14 +9,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from hla_app.data.luminex_parser import ParsedLuminexCsv, parse_luminex_csv
-from hla_app.reports.excel_ab_titer import (
+from hla_app.reports.excel_avg_titer import (
     build_titer_excel_filename,
     build_titer_group_key,
-    create_titer_a_b_drb1_excel_from_parsed,
-    create_titer_a_b_drb1_excel_from_parsed_group,
+    create_avg_titer_excel_from_parsed,
+    create_avg_titer_excel_from_parsed_group,
     has_titer_rows_from_parsed,
     has_titer_rows_from_parsed_group,
 )
@@ -71,6 +72,11 @@ def _build_target_output_path(
 def build_avg_excels(
     csv_paths: list[Path],
     min_titer: int = DEFAULT_AVG_MIN_TITER,
+    num_register_text: str | None = None,
+    *,
+    test_date: date | None = None,
+    patient_dir_name_text: str | None = None,
+    dry_run: bool = False,
 ) -> SumBuildResult:
 
     outputs: list[Path] = []
@@ -81,22 +87,22 @@ def build_avg_excels(
     min_titer = max(0, int(min_titer))
     configured_output_dir = load_effective_path_preferences().sum_save_dir
 
-    if configured_output_dir is not None:
+    if configured_output_dir is not None and not dry_run:
         configured_output_dir.mkdir(parents=True, exist_ok=True)
 
     for csv_path in csv_paths:
         if not csv_path.exists():
             continue
 
-        parsed = parse_luminex_csv(csv_path)
+        parsed_csv = parse_luminex_csv(csv_path)
         hla_class, has_rows = has_titer_rows_from_parsed(
-            parsed,
+            parsed_csv,
             min_titer=min_titer,
         )
         prepared_items.append(
             PreparedAvgCsv(
                 csv_path=csv_path,
-                parsed=parsed,
+                parsed=parsed_csv,
                 hla_class=hla_class,
                 has_rows=has_rows,
             )
@@ -133,20 +139,31 @@ def build_avg_excels(
             else pair_items[0].csv_path.parent
         )
 
-        base_name = build_titer_excel_filename(pair_items[0].parsed.patient, "I_II")
+        base_name = build_titer_excel_filename(
+            pair_items[0].parsed.patient,
+            "I_II",
+            pair_items[0].parsed.batch_date,
+            num_register_text,
+            patient_dir_name_text=patient_dir_name_text,
+        )
         target_output = _build_target_output_path(
             output_dir=output_dir,
             base_name=base_name,
             filename_counts=filename_counts,
         )
 
-        outputs.append(
-            create_titer_a_b_drb1_excel_from_parsed_group(
-                pair_parsed,
-                target_output,
-                min_titer=min_titer,
+        if dry_run:
+            outputs.append(target_output)
+        else:
+            outputs.append(
+                create_avg_titer_excel_from_parsed_group(
+                    pair_parsed,
+                    target_output,
+                    min_titer=min_titer,
+                    test_date=test_date,
+                    num_register_text=num_register_text,
+                )
             )
-        )
 
         for item in pair_items:
             consumed_ids.add(id(item))
@@ -174,20 +191,31 @@ def build_avg_excels(
             else item.csv_path.parent
         )
 
-        base_name = build_titer_excel_filename(item.parsed.patient, item.hla_class)
+        base_name = build_titer_excel_filename(
+            item.parsed.patient,
+            item.hla_class,
+            item.parsed.batch_date,
+            num_register_text,
+            patient_dir_name_text=patient_dir_name_text,
+        )
         target_output = _build_target_output_path(
             output_dir=output_dir,
             base_name=base_name,
             filename_counts=filename_counts,
         )
 
-        outputs.append(
-            create_titer_a_b_drb1_excel_from_parsed(
-                item.parsed,
-                target_output,
-                min_titer=min_titer,
+        if dry_run:
+            outputs.append(target_output)
+        else:
+            outputs.append(
+                create_avg_titer_excel_from_parsed(
+                    item.parsed,
+                    target_output,
+                    min_titer=min_titer,
+                    test_date=test_date,
+                    num_register_text=num_register_text,
+                )
             )
-        )
 
     return SumBuildResult(
         outputs=outputs,

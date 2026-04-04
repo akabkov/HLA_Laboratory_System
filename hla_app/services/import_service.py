@@ -289,7 +289,7 @@ def do_import(
         for hla_class, csv_path in selected_csvs.items():
             target_excel = test_dir / class_result_file_name(hla_class)
             prepare_output_path(target_excel)
-            create_sorted_excel_result(csv_path, target_excel)
+            create_sorted_excel_result(csv_path, target_excel, inp.test_date)
 
             if source_dir is None:
                 raise RuntimeError(

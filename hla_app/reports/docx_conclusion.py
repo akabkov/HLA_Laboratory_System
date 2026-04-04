@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
@@ -75,6 +75,10 @@ def create_hla_conclusion_docx(
     middle_name: str,
     screening: bool,
     clinic_name: str,
+    laboratory_name: str,
+    results_title: str,
+    destination_institution_label: str | None,
+    phenotype_line_text: str | None,
     *,
     output_path: str | Path | None = None,
     overwrite: bool = False,
@@ -133,32 +137,61 @@ def create_hla_conclusion_docx(
         run.italic = italic
         return run
 
+    def add_fill_line(p, label: str, line_width, start_at=None):
+        prefix = ""
+        if start_at is not None:
+            p.paragraph_format.tab_stops.add_tab_stop(start_at, WD_TAB_ALIGNMENT.LEFT)
+            prefix = "\t"
+
+        p.paragraph_format.tab_stops.add_tab_stop(
+            line_width,
+            WD_TAB_ALIGNMENT.RIGHT,
+            WD_TAB_LEADER.LINES,
+        )
+        add_run(p, f"{prefix}{label}\t")
+
     def sort_specificity(antibodies: list[dict]) -> list[str]:
         if not antibodies:
             return []
 
         allele_groups: dict[str, set[int]] = defaultdict(set)
+        public_epitopes: set[str] = set()
 
         for ab in antibodies:
             spec = (ab.get("Specificity") or "").strip()
-            if "*" not in spec:
+            if not spec:
                 continue
+
+            if "*" not in spec:
+                public_epitopes.add(spec)
+                continue
+
             gene, rest = spec.split("*", 1)
             gene = gene.strip()
             if not gene:
                 continue
+
             group = rest.split(":", 1)[0].strip()
             if group.isdigit():
                 allele_groups[gene].add(int(group))
 
-        lines: list[str] = []
-        for gene in sorted(allele_groups):
-            groups = ", ".join(f"{g:02d}" for g in sorted(allele_groups[gene]))
-            lines.append(f"{gene}* {groups}")
+        lines: list[tuple[str, str]] = []
+        for gene, group_values in allele_groups.items():
+            if not group_values:
+                continue
+
+            groups = ", ".join(f"{g:02d}" for g in sorted(group_values))
+            lines.append((gene.casefold(), f"{gene}* {groups}"))
+
+        for public_epitope in public_epitopes:
+            lines.append((public_epitope.casefold(), public_epitope))
+
+        sorted_lines = [text for _sort_key, text in sorted(lines)]
 
         result: list[str] = []
-        for i, line in enumerate(lines):
-            result.append(line + ("." if i == len(lines) - 1 else ";"))
+        for i, line in enumerate(sorted_lines):
+            result.append(line + ("." if i == len(sorted_lines) - 1 else ";"))
+
         return result
 
     def add_class_block(doc: Document, data: dict):
@@ -281,6 +314,8 @@ def create_hla_conclusion_docx(
     section.bottom_margin = Cm(2.54)
     section.left_margin = Cm(1.91)
     section.right_margin = Cm(1.91)
+    line_width = section.page_width - section.left_margin - section.right_margin
+    line_midpoint = line_width // 2
 
     patient_full_name = f"{last_name} {first_name}"
     if middle_name:
@@ -295,13 +330,13 @@ def create_hla_conclusion_docx(
     add_run(p, clinic_name, bold=True)
 
     p = add_paragraph(doc, WD_ALIGN_PARAGRAPH.CENTER)
-    add_run(p, "Лаборатория HLA-типирования", bold=True)
+    add_run(p, laboratory_name, bold=True)
 
     empty_paragraph(doc)
     empty_paragraph(doc)
 
     p = add_paragraph(doc, WD_ALIGN_PARAGRAPH.CENTER)
-    add_run(p, "Результаты определения анти-HLA-антител", bold=True)
+    add_run(p, results_title, bold=True)
 
     empty_paragraph(doc)
     empty_paragraph(doc)
@@ -311,12 +346,29 @@ def create_hla_conclusion_docx(
     now = datetime.now()
     add_run(p, f"«{now.day:02d}» {MONTHS[now.month]} {now.year} г.")
 
+    if destination_institution_label:
+        add_fill_line(
+            p,
+            destination_institution_label,
+            line_width,
+            start_at=line_midpoint,
+        )
+
+    p = add_paragraph(doc)
+    add_run(p, f"№ {num_register}")
+
     empty_paragraph(doc)
 
     p = add_paragraph(doc)
     add_run(p, f"ФИО пациента: {patient_full_name}", bold=True)
 
     empty_paragraph(doc)
+
+    if phenotype_line_text:
+        p = add_paragraph(doc)
+        add_fill_line(p, phenotype_line_text, line_width)
+
+        empty_paragraph(doc)
 
     class1_to_render = class1
     class2_to_render = class2

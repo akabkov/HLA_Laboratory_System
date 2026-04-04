@@ -1,3 +1,10 @@
+"""Межклиентская advisory-блокировка записывающих операций через PostgreSQL.
+
+Модуль используется только в write-контуре: импорт, замена и удаление
+исследований. Read-only сценарии, такие как окно динамики антител, не должны
+использовать этот lock.
+"""
+
 from __future__ import annotations
 
 import time
@@ -7,6 +14,7 @@ from sqlalchemy import text
 
 from hla_app.db.engine import get_engine
 
+# --- Advisory lock constants, общие для всех клиентов приложения ---
 _LOCK_KEY_1 = 42117
 _LOCK_KEY_2 = 1
 
@@ -15,6 +23,7 @@ class SharedWriteLockBusyError(RuntimeError):
     pass
 
 
+# --- Публичный context manager для операций, меняющих файловую базу и PostgreSQL ---
 @contextmanager
 def acquire_shared_write_lock(
     *,
@@ -38,6 +47,8 @@ def acquire_shared_write_lock(
         deadline = time.monotonic() + max(0.1, float(timeout_sec))
 
         while True:
+            # Повторяем pg_try_advisory_lock до таймаута, чтобы не зависать
+            # навсегда при активной записи из другого клиента.
             locked = bool(
                 conn.execute(
                     text("SELECT pg_try_advisory_lock(:key1, :key2)"),

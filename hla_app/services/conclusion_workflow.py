@@ -18,11 +18,18 @@ from hla_app.services.conclusion_service import (
     normalize_staff_name,
     suggest_conclusion_filename,
 )
+from hla_app.utils.validators import is_positive_int_text_without_leading_zero
 
 # --- Названия учреждений для шапки заключения ---
 
 _FIRST_CLINIC_FULL_NAME = "ГУ «Минский НПЦ хирургии, трансплантологии и гематологии»"
 _SECOND_CLINIC_FULL_NAME = "ГУ «РНПЦ трансфузиологии и медицинских биотехнологий»"
+_FIRST_CLINIC_LABORATORY_NAME = "Лаборатория HLA-типирования"
+_SECOND_CLINIC_LABORATORY_NAME = "Лаборатория HLA-типирования органов и тканей"
+_FIRST_CLINIC_RESULTS_TITLE = "Результаты определения анти-HLA-антител"
+_SECOND_CLINIC_RESULTS_TITLE = "Результаты определения HLA-фенотипа и анти-HLA-антител"
+_SECOND_CLINIC_PHENOTYPE_LINE = "HLA-фенотип:"
+_SECOND_CLINIC_DESTINATION_INSTITUTION_LABEL = "Учреждение:"
 
 
 # --- Полезная нагрузка сценария формирования заключения ---
@@ -43,6 +50,10 @@ class ConclusionPayload:
     middle_name: str
     screening: bool
     clinic_name: str
+    laboratory_name: str
+    results_title: str
+    destination_institution_label: str | None
+    phenotype_line_text: str | None
 
     @property
     def suggested_filename(self) -> str:
@@ -57,11 +68,35 @@ class ConclusionPayload:
 # --- Подготовка реквизитов учреждения и данных для документа ---
 
 
-def resolve_clinic_name(clinic: str) -> str:
-    if clinic == "f_clinic":
-        return _FIRST_CLINIC_FULL_NAME
-    if clinic == "s_clinic":
-        return _SECOND_CLINIC_FULL_NAME
+@dataclass(frozen=True)
+class ConclusionClinicPresentation:
+    clinic_name: str
+    laboratory_name: str
+    results_title: str
+    destination_institution_label: str | None = None
+    phenotype_line_text: str | None = None
+
+
+_CLINIC_PRESENTATIONS = {
+    "f_clinic": ConclusionClinicPresentation(
+        clinic_name=_FIRST_CLINIC_FULL_NAME,
+        laboratory_name=_FIRST_CLINIC_LABORATORY_NAME,
+        results_title=_FIRST_CLINIC_RESULTS_TITLE,
+    ),
+    "s_clinic": ConclusionClinicPresentation(
+        clinic_name=_SECOND_CLINIC_FULL_NAME,
+        laboratory_name=_SECOND_CLINIC_LABORATORY_NAME,
+        results_title=_SECOND_CLINIC_RESULTS_TITLE,
+        destination_institution_label=_SECOND_CLINIC_DESTINATION_INSTITUTION_LABEL,
+        phenotype_line_text=_SECOND_CLINIC_PHENOTYPE_LINE,
+    ),
+}
+
+
+def resolve_clinic_presentation(clinic: str) -> ConclusionClinicPresentation:
+    presentation = _CLINIC_PRESENTATIONS.get(clinic)
+    if presentation is not None:
+        return presentation
 
     raise ValueError(
         f"Для заключения выберите учреждение: {FIRST_CLINIC} или {SECOND_CLINIC}."
@@ -97,8 +132,11 @@ def build_conclusion_payload(
         raise ValueError("Для заключения заполните Имя.")
 
     num_register_text = (num_register_text or "").strip()
-    if not num_register_text.isdigit():
-        raise ValueError("Поле «№ по журналу» должно быть заполнено (только цифры).")
+    if not is_positive_int_text_without_leading_zero(num_register_text):
+        raise ValueError(
+            "Поле «№ по журналу» должно быть заполнено "
+            "(только цифры, без начального 0)."
+        )
     num_register = int(num_register_text)
 
     if clinic is None:
@@ -107,7 +145,7 @@ def build_conclusion_payload(
         )
 
     clinic_code = clinic
-    clinic_name = resolve_clinic_name(clinic_code)
+    presentation = resolve_clinic_presentation(clinic_code)
 
     head_of = normalize_staff_name(head_of_text)
     biologist1 = normalize_staff_name(biologist1_text)
@@ -144,7 +182,11 @@ def build_conclusion_payload(
         first_name=first_name,
         middle_name=normalized_middle_name,
         screening=screening,
-        clinic_name=clinic_name,
+        clinic_name=presentation.clinic_name,
+        laboratory_name=presentation.laboratory_name,
+        results_title=presentation.results_title,
+        destination_institution_label=presentation.destination_institution_label,
+        phenotype_line_text=presentation.phenotype_line_text,
     )
 
 
@@ -171,6 +213,10 @@ def save_conclusion_docx(
         middle_name=payload.middle_name,
         screening=payload.screening,
         clinic_name=payload.clinic_name,
+        laboratory_name=payload.laboratory_name,
+        results_title=payload.results_title,
+        destination_institution_label=payload.destination_institution_label,
+        phenotype_line_text=payload.phenotype_line_text,
         output_path=output_path,
         overwrite=overwrite,
     )

@@ -2,13 +2,14 @@
 
 В файле находятся правила именования итоговых Excel-файлов, подготовка
 таблиц по антителам, объединение Class I и Class II и само оформление листа
-через `create_titer_a_b_drb1_excel_from_parsed*`. Все изменения формата этого
+через `create_avg_titer_excel_from_parsed*`. Все изменения формата этого
 отчета и логики его объединения удобно искать здесь.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -28,7 +29,7 @@ from hla_app.utils.patient_name import (
     format_patient_short_name,
     normalize_patient_name,
 )
-from hla_app.utils.validators import cap_hyphenated_fio_part
+from hla_app.utils.validators import cap_hyphenated_fio_part, format_ddmmyyyy
 
 # --- Именование итоговых Excel-файлов и ключи группировки ---
 
@@ -53,8 +54,18 @@ def build_patient_prefix(patient: str) -> str:
     return _INVALID_FILENAME_CHARS_RE.sub("_", prefix)
 
 
-def build_titer_excel_filename(patient: str, hla_class: str) -> str:
-    return f"{build_patient_prefix(patient)}_AvgValue_Class_{hla_class}.xlsx"
+def build_titer_excel_filename(
+    patient: str,
+    hla_class: str,
+    batch_date: str,
+    num_register_text: str | None = None,
+    *,
+    patient_dir_name_text: str | None = None,
+) -> str:
+    prefix = f"{num_register_text}__" if (num_register_text or "") else ""
+    patient_part = patient_dir_name_text or build_patient_prefix(patient)
+
+    return f"{prefix}{patient_part}__AvgTiter_Class_{hla_class}__{batch_date}.xlsx"
 
 
 def build_titer_group_key(parsed: ParsedLuminexCsv) -> tuple[str, str]:
@@ -186,10 +197,13 @@ def has_titer_rows_from_parsed_group(
 # --- Генерация Excel по одному классу или по объединенной паре ---
 
 
-def create_titer_a_b_drb1_excel_from_parsed(
+def create_avg_titer_excel_from_parsed(
     parsed: ParsedLuminexCsv,
     output_path: Path,
     min_titer: int = 0,
+    *,
+    test_date: date | None = None,
+    num_register_text: str | None = None,
 ) -> Path:
     """
     Создаёт Excel-файл по уже распарсенному ParsedLuminexCsv
@@ -199,6 +213,9 @@ def create_titer_a_b_drb1_excel_from_parsed(
         raise ValueError("Не удалось определить Class (I/II) в CSV")
 
     patient_norm = format_patient_short_name(parsed.patient)
+    report_date = (
+        format_ddmmyyyy(test_date) if test_date is not None else parsed.batch_date
+    )
     dataframe = build_titer_dataframe(
         antibodies=[item.as_report_dict() for item in parsed.antibodies],
         hla_class=parsed.hla_class,
@@ -230,7 +247,7 @@ def create_titer_a_b_drb1_excel_from_parsed(
     sheet["A1"].font = bold
 
     sheet.merge_cells("A2:C2")
-    sheet["A2"] = f"Date: {parsed.batch_date}"
+    sheet["A2"] = f"Date: {report_date}"
     sheet["A2"].alignment = center
     sheet["A2"].font = bold
 
@@ -239,6 +256,11 @@ def create_titer_a_b_drb1_excel_from_parsed(
     sheet["A4"].font = bold
     sheet.merge_cells("B4:C4")
     sheet["B4"] = patient_norm
+
+    if num_register_text:
+        sheet["D4"] = num_register_text
+        sheet["D4"].alignment = center
+        sheet["D4"].font = bold
 
     sheet["C5"] = "% PRA:"
     sheet["C5"].alignment = center
@@ -250,6 +272,13 @@ def create_titer_a_b_drb1_excel_from_parsed(
     sheet["A6"].font = bold
 
     auto_width(sheet, 5, sheet.max_row)
+
+    if num_register_text:
+        sheet.column_dimensions["D"].width = max(
+            sheet.column_dimensions["D"].width or 0,
+            len(str(num_register_text)) + 2,
+        )
+
     center_range(sheet, 7, sheet.max_row, 1, sheet.max_column)
     protect_sheet(sheet, "0")
 
@@ -257,10 +286,13 @@ def create_titer_a_b_drb1_excel_from_parsed(
     return excel_file
 
 
-def create_titer_a_b_drb1_excel_from_parsed_group(
+def create_avg_titer_excel_from_parsed_group(
     parsed_items: list[ParsedLuminexCsv],
     output_path: Path,
     min_titer: int = 0,
+    *,
+    test_date: date | None = None,
+    num_register_text: str | None = None,
 ) -> Path:
     """
     Создаёт один общий Excel для пары CSV Class I и Class II,
@@ -270,6 +302,9 @@ def create_titer_a_b_drb1_excel_from_parsed_group(
         raise ValueError("Не переданы данные для построения общего Excel")
 
     first = parsed_items[0]
+    report_date = (
+        format_ddmmyyyy(test_date) if test_date is not None else first.batch_date
+    )
     group_key = build_titer_group_key(first)
 
     if any(build_titer_group_key(item) != group_key for item in parsed_items[1:]):
@@ -315,7 +350,7 @@ def create_titer_a_b_drb1_excel_from_parsed_group(
     sheet["A1"].font = bold
 
     sheet.merge_cells("A2:C2")
-    sheet["A2"] = f"Date: {first.batch_date}"
+    sheet["A2"] = f"Date: {report_date}"
     sheet["A2"].alignment = center
     sheet["A2"].font = bold
 
@@ -324,6 +359,11 @@ def create_titer_a_b_drb1_excel_from_parsed_group(
     sheet["A4"].font = bold
     sheet.merge_cells("B4:C4")
     sheet["B4"] = patient_norm
+
+    if num_register_text:
+        sheet["D4"] = num_register_text
+        sheet["D4"].alignment = center
+        sheet["D4"].font = bold
 
     sheet["C5"] = "% PRA:"
     sheet["C5"].alignment = center
@@ -337,6 +377,13 @@ def create_titer_a_b_drb1_excel_from_parsed_group(
     sheet["A6"].font = bold
 
     auto_width(sheet, 5, sheet.max_row)
+
+    if num_register_text:
+        sheet.column_dimensions["D"].width = max(
+            sheet.column_dimensions["D"].width or 0,
+            len(str(num_register_text)) + 2,
+        )
+
     center_range(sheet, 7, sheet.max_row, 1, sheet.max_column)
     protect_sheet(sheet, "0")
 

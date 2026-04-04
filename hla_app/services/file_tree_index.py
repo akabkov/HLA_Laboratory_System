@@ -10,11 +10,18 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
+
+from hla_app.services.runtime_diagnostics import (
+    log_runtime_event,
+    log_runtime_exception,
+)
+from hla_app.utils.validators import normalize_for_match
 
 # --- Структура результата поиска по локальному индексу ---
 
@@ -22,6 +29,7 @@ from threading import RLock
 @dataclass(frozen=True)
 class FileTreeIndexHit:
     path: Path
+    is_dir: bool
 
 
 # --- Сервис построения и чтения локального SQLite-индекса ---
@@ -36,7 +44,9 @@ class FileTreeIndexService:
     Это важно, чтобы во время перестроения не испортить рабочий индекс.
     """
 
-    SCHEMA_VERSION = "1"
+    SCHEMA_VERSION = "2"
+    _SCAN_DIR_MAX_ATTEMPTS = 3
+    _SCAN_DIR_RETRY_DELAY_SECONDS = 0.35
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -59,14 +69,15 @@ class FileTreeIndexService:
         conn.execute("""--sql
             CREATE TABLE IF NOT EXISTS
                 entries (
-                    path TEXT PRIMARY KEY,
+                    PATH TEXT PRIMARY KEY,
                     parent_path TEXT NOT NULL,
                     rel_path TEXT NOT NULL,
-                    name TEXT NOT NULL,
+                    NAME TEXT NOT NULL,
                     name_folded TEXT NOT NULL,
+                    name_match TEXT NOT NULL,
                     is_dir INTEGER NOT NULL
                 )
-            """)
+        """)
         conn.execute("""--sql
             CREATE INDEX IF NOT EXISTS ix_entries_parent_path ON entries (parent_path)
             """)
@@ -74,9 +85,12 @@ class FileTreeIndexService:
             CREATE INDEX IF NOT EXISTS ix_entries_name_folded ON entries (name_folded)
             """)
         conn.execute("""--sql
+            CREATE INDEX IF NOT EXISTS ix_entries_name_match ON entries (name_match)
+            """)
+        conn.execute("""--sql
             CREATE TABLE IF NOT EXISTS
                 meta (KEY TEXT PRIMARY KEY, VALUE TEXT NOT NULL)
-            """)
+        """)
         conn.commit()
 
     def _normalize_path(self, path: Path | str) -> Path:
@@ -120,6 +134,77 @@ class FileTreeIndexService:
 
         return self._is_source_files_rel_parts(rel_parts)
 
+    def _scan_directory_rows(
+        self,
+        *,
+        root_dir: Path,
+        current_dir: Path,
+    ) -> tuple[list[tuple[str, str, str, str, str, str, int]], list[Path], int]:
+        last_error: Exception | None = None
+
+        for attempt in range(1, self._SCAN_DIR_MAX_ATTEMPTS + 1):
+            rows: list[tuple[str, str, str, str, str, str, int]] = []
+            child_dirs: list[Path] = []
+
+            try:
+                with os.scandir(current_dir) as it:
+                    for entry in it:
+                        entry_path = Path(entry.path).resolve(strict=False)
+                        is_dir = entry.is_dir(follow_symlinks=False)
+
+                        if self._is_source_files_path(
+                            root_dir=root_dir,
+                            path=entry_path,
+                        ):
+                            continue
+
+                        try:
+                            rel_path = str(entry_path.relative_to(root_dir))
+                        except Exception:
+                            rel_path = entry_path.name
+
+                        rows.append(
+                            (
+                                str(entry_path),
+                                str(current_dir),
+                                rel_path,
+                                entry.name,
+                                entry.name.casefold(),
+                                normalize_for_match(
+                                    entry.name,
+                                    strict_first_char=True,
+                                ),
+                                1 if is_dir else 0,
+                            )
+                        )
+
+                        if is_dir:
+                            child_dirs.append(entry_path)
+
+                if attempt > 1:
+                    log_runtime_event(
+                        "info",
+                        (
+                            "Индекс файлового дерева: каталог успешно прочитан после "
+                            f"повтора ({attempt}/{self._SCAN_DIR_MAX_ATTEMPTS}): "
+                            f"{current_dir}"
+                        ),
+                    )
+
+                return rows, child_dirs, attempt - 1
+            except Exception as exc:
+                last_error = exc
+
+                if attempt >= self._SCAN_DIR_MAX_ATTEMPTS:
+                    break
+
+                time.sleep(self._SCAN_DIR_RETRY_DELAY_SECONDS * attempt)
+
+        if last_error is None:
+            last_error = RuntimeError(f"Не удалось прочитать каталог: {current_dir}")
+
+        raise last_error
+
     def is_ready_for(self, root_dir: Path | str) -> bool:
         root_dir = self._normalize_path(root_dir)
 
@@ -161,7 +246,8 @@ class FileTreeIndexService:
 
         entry_count = 0
         skipped_dir_count = 0
-        batch: list[tuple[str, str, str, str, str, int]] = []
+        retried_dir_count = 0
+        batch: list[tuple[str, str, str, str, str, str, int]] = []
 
         def flush_batch(conn: sqlite3.Connection) -> None:
             nonlocal batch
@@ -172,15 +258,16 @@ class FileTreeIndexService:
                 """--sql
                 INSERT INTO
                     entries (
-                        path,
+                        PATH,
                         parent_path,
                         rel_path,
-                        name,
+                        NAME,
                         name_folded,
+                        name_match,
                         is_dir
                     )
                 VALUES
-                    (?, ?, ?, ?, ?, ?)
+                    (?, ?, ?, ?, ?, ?, ?)
                 """,
                 batch,
             )
@@ -201,6 +288,7 @@ class FileTreeIndexService:
                     "",
                     root_name,
                     root_name.casefold(),
+                    normalize_for_match(root_name, strict_first_char=True),
                     1,
                 )
             )
@@ -212,45 +300,31 @@ class FileTreeIndexService:
                 current_dir = stack.pop()
 
                 try:
-                    with os.scandir(current_dir) as it:
-                        for entry in it:
-                            entry_path = Path(entry.path).resolve(strict=False)
-                            is_dir = entry.is_dir(follow_symlinks=False)
-
-                            if self._is_source_files_path(
-                                root_dir=root_dir,
-                                path=entry_path,
-                            ):
-                                continue
-
-                            try:
-                                rel_path = str(entry_path.relative_to(root_dir))
-                            except Exception:
-                                rel_path = entry_path.name
-
-                            batch.append(
-                                (
-                                    str(entry_path),
-                                    str(current_dir),
-                                    rel_path,
-                                    entry.name,
-                                    entry.name.casefold(),
-                                    1 if is_dir else 0,
-                                )
-                            )
-                            entry_count += 1
-
-                            if is_dir:
-                                stack.append(entry_path)
-
-                            if len(batch) >= 2000:
-                                flush_batch(conn)
-
-                except Exception:
+                    dir_rows, child_dirs, retry_count = self._scan_directory_rows(
+                        root_dir=root_dir,
+                        current_dir=current_dir,
+                    )
+                    retried_dir_count += retry_count
+                except Exception as exc:
                     # Не валим весь индекс из-за одной проблемной папки,
                     # но фиксируем, что этот каталог не удалось прочитать.
                     skipped_dir_count += 1
+                    log_runtime_exception(
+                        (
+                            "Индекс файлового дерева: не удалось прочитать каталог "
+                            f"после {self._SCAN_DIR_MAX_ATTEMPTS} попыток: "
+                            f"{current_dir}"
+                        ),
+                        exc,
+                    )
                     continue
+
+                batch.extend(dir_rows)
+                entry_count += len(dir_rows)
+                stack.extend(child_dirs)
+
+                if len(batch) >= 2000:
+                    flush_batch(conn)
 
             flush_batch(conn)
 
@@ -268,6 +342,16 @@ class FileTreeIndexService:
 
         with self._lock:
             tmp_db_path.replace(self.db_path)
+
+        log_runtime_event(
+            "info",
+            (
+                "Локальный индекс файлового дерева обновлен: "
+                f"root={root_dir}; entries={entry_count}; "
+                f"skipped_dirs={skipped_dir_count}; retry_attempts={retried_dir_count}; "
+                f"db={self.db_path}"
+            ),
+        )
 
         return entry_count
 
@@ -302,34 +386,47 @@ class FileTreeIndexService:
 
         base_dir_text = str(base_dir)
         base_dir_prefix = base_dir_text + os.sep
-        query_like = "%" + self._escape_like(query.casefold()) + "%"
+        query_folded = query.casefold()
+        query_match = normalize_for_match(query, strict_first_char=True)
+        query_like = "%" + self._escape_like(query_folded) + "%"
+        query_match_like = (
+            "%" + self._escape_like(query_match) + "%" if query_match else None
+        )
+        name_match_clause = "name_folded LIKE ? ESCAPE '\\'"
+        params: list[object] = [query_like]
+        if query_match_like is not None:
+            name_match_clause = (
+                "(name_folded LIKE ? ESCAPE '\\' OR name_match LIKE ? ESCAPE '\\')"
+            )
+            params.append(query_match_like)
+
+        params.extend([base_dir_text, base_dir_prefix + "%", int(limit)])
+        sql = f"""--sql
+            SELECT
+                PATH,
+                is_dir
+            FROM
+                entries
+            WHERE
+                {name_match_clause}
+                AND (
+                    PATH = ?
+                    OR PATH LIKE ?
+                )
+            ORDER BY
+                is_dir DESC,
+                NAME COLLATE NOCASE ASC,
+                rel_path COLLATE NOCASE ASC
+            LIMIT
+                ?
+        """
 
         with self._lock:
             with closing(self._connect(self.db_path)) as conn:
-                rows = conn.execute(
-                    """--sql
-                    SELECT
-                        path
-                    FROM
-                        entries
-                    WHERE
-                        name_folded LIKE ? ESCAPE '\\'
-                        AND (
-                            path = ?
-                            OR path LIKE ?
-                        )
-                    ORDER BY
-                        is_dir DESC,
-                        name COLLATE NOCASE ASC,
-                        rel_path COLLATE NOCASE ASC
-                    LIMIT
-                        ?
-                    """,
-                    (query_like, base_dir_text, base_dir_prefix + "%", int(limit)),
-                ).fetchall()
+                rows = conn.execute(sql, params).fetchall()
 
         return [
-            FileTreeIndexHit(path=Path(row["path"]))
+            FileTreeIndexHit(path=Path(row["path"]), is_dir=bool(row["is_dir"]))
             for row in rows
             if not self._is_source_files_path(
                 root_dir=root_dir,
