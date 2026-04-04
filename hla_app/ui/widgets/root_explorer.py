@@ -8,19 +8,25 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
+import struct
 import subprocess
 import sys
 import warnings
 from collections.abc import Callable
 from pathlib import Path
 
+import pythoncom
+import win32clipboard
+import winerror
 from PySide6.QtCore import (
     QCoreApplication,
     QDir,
     QEvent,
     QEventLoop,
+    QMimeData,
     QModelIndex,
     QSize,
     QSortFilterProxyModel,
@@ -33,6 +39,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QDesktopServices,
+    QDrag,
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
@@ -59,6 +66,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from win32comext.shell import shell, shellcon
 
 from hla_app.config.managed_files import (
     MANAGED_STUDY_FILE_NAMES,
@@ -66,7 +74,11 @@ from hla_app.config.managed_files import (
 )
 from hla_app.config.settings import DEFAULT_DIALOG_DIR, ORGANS
 from hla_app.services.app_prefs import load_effective_app_preferences
-from hla_app.services.file_tree_index import FileTreeIndexService
+from hla_app.services.file_tree_index import FileTreeIndexHit, FileTreeIndexService
+from hla_app.services.runtime_diagnostics import (
+    log_runtime_event,
+    log_runtime_exception,
+)
 from hla_app.services.shared_write_lock import (
     SharedWriteLockBusyError,
     acquire_shared_write_lock,
@@ -122,11 +134,72 @@ _SEARCH_NAVIGATION_RETRY_LIMIT = 50
 _SEARCH_NAVIGATION_RETRY_INTERVAL_MS = 100
 _SEARCH_RESULTS_ROW_EXTRA_HEIGHT_PX = 16
 
+# Константы внутреннего MIME и Windows Shell-форматов для копирования из бокового проводника.
+_INTERNAL_LOCAL_PATHS_MIME = "application/x-hla-local-path-list"
+_WINDOWS_REMOTE_DRIVE_TYPE = 4
+_WINDOWS_DROPEFFECT_COPY = 1
+_WINDOWS_URLACTION_SHELL_ENHANCED_DRAGDROP_SECURITY = 0x0000180B
+_WINDOWS_CLIPBOARD_MIME_TEMPLATE = 'application/x-qt-windows-mime;value="{name}"'
+_WINDOWS_FILENAME_FORMAT = "FileName"
+_WINDOWS_FILENAME_W_FORMAT = "FileNameW"
+_WINDOWS_PREFERRED_DROP_EFFECT_FORMAT = "Preferred DropEffect"
+_WINDOWS_UNTRUSTED_DRAG_DROP_FORMAT = "UntrustedDragDrop"
+_WINDOWS_MK_LBUTTON = 0x0001
+_WINDOWS_S_OK = 0
+_WINDOWS_S_FALSE = 1
+
 # Базовые размеры панели проводника
 EXPLORER_MIN_WIDTH = 200
 EXPLORER_MAX_WIDTH = 400
 EXPLORER_AVG_WIDTH = EXPLORER_MIN_WIDTH + (EXPLORER_MAX_WIDTH - EXPLORER_MIN_WIDTH) / 2
 _SEARCH_NAVIGATION_HORIZONTAL_OFFSET_PX = -32
+_NATIVE_SHDRAGDROP_DISABLED = (
+    os.environ.get("HLA_DISABLE_NATIVE_SHELL_DRAGDROP", "").strip() == "1"
+)
+_WINDOWS_SH_DO_DRAG_DROP = ctypes.WinDLL("shell32", use_last_error=True).SHDoDragDrop
+_WINDOWS_SH_DO_DRAG_DROP.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32),
+]
+_WINDOWS_SH_DO_DRAG_DROP.restype = ctypes.c_long
+_WINDOWS_OLE32 = ctypes.WinDLL("ole32", use_last_error=True)
+_WINDOWS_OLE32.OleInitialize.argtypes = [ctypes.c_void_p]
+_WINDOWS_OLE32.OleInitialize.restype = ctypes.c_long
+_WINDOWS_OLE32.OleUninitialize.argtypes = []
+_WINDOWS_OLE32.OleUninitialize.restype = None
+
+
+def _windows_com_object_address(com_object) -> int | None:
+    # pywin32 не даёт прямой доступ к указателю IDataObject, а SHDoDragDrop
+    # ожидает именно COM-pointer, поэтому извлекаем его из repr-строки объекта.
+    match = re.search(r"obj at 0x([0-9A-Fa-f]+)", repr(com_object))
+    if match is None:
+        return None
+
+    try:
+        return int(match.group(1), 16)
+    except ValueError:
+        return None
+
+
+class _WindowsShellDropSource:
+    _public_methods_ = ["QueryContinueDrag", "GiveFeedback"]
+    _com_interfaces_ = [pythoncom.IID_IDropSource]
+
+    def QueryContinueDrag(self, escape_pressed: int, key_state: int) -> int:
+        if escape_pressed:
+            return winerror.DRAGDROP_S_CANCEL
+
+        if not (int(key_state) & _WINDOWS_MK_LBUTTON):
+            return winerror.DRAGDROP_S_DROP
+
+        return 0
+
+    def GiveFeedback(self, _effect: int) -> int:
+        return winerror.DRAGDROP_S_USEDEFAULTCURSORS
 
 
 # --- Вспомогательные модель, proxy, delegate и специализированный tree view ---
@@ -384,10 +457,11 @@ class ExplorerTreeView(QTreeView):
         super().__init__(owner)
         self._owner = owner
 
+        self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         self.setDropIndicatorShown(True)
-        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
 
     def keyPressEvent(self, event) -> None:
@@ -421,6 +495,16 @@ class ExplorerTreeView(QTreeView):
                 event.accept()
                 return
 
+        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
+            self._owner._paste_from_clipboard(self._owner._current_paste_target_dir())
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_C and event.modifiers() == Qt.ControlModifier:
+            if self._owner._copy_selected_paths_to_clipboard():
+                event.accept()
+                return
+
         super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:
@@ -445,21 +529,12 @@ class ExplorerTreeView(QTreeView):
         return event.pos()
 
     def _extract_local_paths(self, event) -> list[Path]:
-        mime = event.mimeData()
-        if mime is None or not mime.hasUrls():
-            return []
-
-        paths: list[Path] = []
-        for url in mime.urls():
-            if not url.isLocalFile():
-                return []
-            path = Path(url.toLocalFile())
-            if path.exists():
-                paths.append(path)
-
-        return paths
+        return self._owner._local_paths_from_mime_data(event.mimeData())
 
     def _can_accept_event(self, event) -> bool:
+        if event.source() in (self, self.viewport()):
+            return False
+
         source_paths = self._extract_local_paths(event)
         if not source_paths:
             return False
@@ -471,6 +546,22 @@ class ExplorerTreeView(QTreeView):
 
         allowed, _reason = self._owner._can_manage_children_in(target_dir)
         return allowed
+
+    def startDrag(self, _supported_actions) -> None:
+        export_paths = self._owner._selected_paths_for_export()
+        if self._owner._start_windows_shell_drag(export_paths):
+            return
+
+        mime = self._owner._mime_data_for_local_paths(
+            export_paths,
+            include_urls=True,
+        )
+        if mime is None:
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._can_accept_event(event):
@@ -543,6 +634,7 @@ class RootExplorerWidget(QWidget):
         self._pending_navigation_attempts = 0
         self._search_mode: str | None = None
         self._force_root_scope_on_initial_load = True
+        self._index_build_in_progress = False
 
         # --- Основной layout, заголовок и элементы поиска ---
         outer = QVBoxLayout(self)
@@ -742,6 +834,29 @@ class RootExplorerWidget(QWidget):
         source_index = self.model.index(str(path))
         return self._map_from_source(source_index)
 
+    def _paths_match(self, left: Path | str | None, right: Path | str | None) -> bool:
+        if left is None or right is None:
+            return False
+
+        left_path = Path(left)
+        right_path = Path(right)
+
+        try:
+            return left_path.resolve(strict=False) == right_path.resolve(strict=False)
+        except Exception:
+            return left_path == right_path
+
+    def _exact_tree_index_for_path(self, path: Path | str) -> QModelIndex:
+        target_path = Path(path)
+        index = self._tree_index_for_path(target_path)
+        if not index.isValid():
+            return QModelIndex()
+
+        if not self._paths_match(self._path_from_index(index), target_path):
+            return QModelIndex()
+
+        return index
+
     def _apply_model_to_tree(self) -> None:
         root_index = self.model.setRootPath(str(self._root_dir))
         self._proxy_model.setSourceModel(self.model)
@@ -907,9 +1022,10 @@ class RootExplorerWidget(QWidget):
 
     # --- Состояние локального индекса и область видимости боковой панели ---
     def notify_index_build_started(self) -> None:
+        self._index_build_in_progress = True
         self.lbl_index_status.setText(
             "Поиск: локальный индекс обновляется. "
-            "До завершения используется резервный режим."
+            "Используется готовый индекс, если он уже есть."
         )
         self.lbl_index_status.setToolTip("Локальный индекс перестраивается в фоне.")
 
@@ -919,6 +1035,7 @@ class RootExplorerWidget(QWidget):
         entry_count: int | None = None,
         skipped_dir_count: int | None = None,
     ) -> None:
+        self._index_build_in_progress = False
         skipped = max(0, int(skipped_dir_count or 0))
 
         if skipped > 0:
@@ -947,6 +1064,7 @@ class RootExplorerWidget(QWidget):
         self.reapply_current_search()
 
     def notify_index_build_failed(self, error_text: str) -> None:
+        self._index_build_in_progress = False
         self.lbl_index_status.setText(
             "Поиск: не удалось обновить локальный индекс. Используется резервный режим."
         )
@@ -985,6 +1103,27 @@ class RootExplorerWidget(QWidget):
         parts = rel.parts
         return bool(parts) and parts[0] in ORGANS
 
+    def _is_index_hit_in_sidebar_scope(self, path: Path) -> bool:
+        """Проверяет путь из локального индекса без обращения к сетевому диску."""
+        path_text = str(path).replace("/", "\\").rstrip("\\")
+        root_text = str(self._root_dir).replace("/", "\\").rstrip("\\")
+
+        path_key = path_text.casefold()
+        root_key = root_text.casefold()
+
+        if path_key == root_key:
+            return True
+
+        if not path_key.startswith(root_key + "\\"):
+            return False
+
+        if not self._root_organs_filter_enabled():
+            return True
+
+        rel_text = path_text[len(root_text) :].lstrip("\\")
+        rel_parts = tuple(part for part in rel_text.split("\\") if part)
+        return bool(rel_parts) and rel_parts[0] in ORGANS
+
     def _is_source_files_path(self, path: Path) -> bool:
         try:
             rel_parts = (
@@ -997,26 +1136,41 @@ class RootExplorerWidget(QWidget):
 
         return len(rel_parts) >= 2 and rel_parts[1] == "source_files"
 
-    def _search_roots_for_base_dir(self, base_dir: Path) -> list[Path]:
-        try:
-            base_resolved = base_dir.resolve(strict=False)
-            root_resolved = self._root_dir.resolve(strict=False)
-        except Exception:
+    def _search_roots_for_base_dir(
+        self,
+        base_dir: Path,
+        *,
+        require_existing: bool = True,
+    ) -> list[Path]:
+        if require_existing:
+            try:
+                base_resolved = base_dir.resolve(strict=False)
+                root_resolved = self._root_dir.resolve(strict=False)
+            except Exception:
+                base_resolved = base_dir
+                root_resolved = self._root_dir
+        else:
             base_resolved = base_dir
             root_resolved = self._root_dir
 
         if not self._root_organs_filter_enabled():
-            if base_dir.exists() and base_dir.is_dir():
+            if not require_existing or (base_dir.exists() and base_dir.is_dir()):
                 return [base_dir]
             return []
 
         if base_resolved == root_resolved:
+            if not require_existing:
+                return [self._root_dir / name for name in ORGANS]
             return self._allowed_root_dirs()
 
-        if (
+        in_scope = (
             self._is_path_in_sidebar_scope(base_dir)
-            and base_dir.exists()
-            and base_dir.is_dir()
+            if require_existing
+            else self._is_index_hit_in_sidebar_scope(base_dir)
+        )
+
+        if in_scope and (
+            not require_existing or (base_dir.exists() and base_dir.is_dir())
         ):
             return [base_dir]
 
@@ -1050,19 +1204,19 @@ class RootExplorerWidget(QWidget):
         base_dir: Path,
         *,
         limit: int = 100,
-    ) -> list[Path]:
+    ) -> list[FileTreeIndexHit]:
         if self._index_service is None:
             return []
 
-        paths: list[Path] = []
+        hits: list[FileTreeIndexHit] = []
         seen: set[str] = set()
 
-        for search_root in self._search_roots_for_base_dir(base_dir):
-            if not search_root.exists() or not search_root.is_dir():
-                continue
-
+        for search_root in self._search_roots_for_base_dir(
+            base_dir,
+            require_existing=False,
+        ):
             try:
-                hits = self._index_service.search(
+                root_hits = self._index_service.search(
                     root_dir=self._root_dir,
                     base_dir=search_root,
                     text=text,
@@ -1071,21 +1225,21 @@ class RootExplorerWidget(QWidget):
             except Exception:
                 continue
 
-            for hit in hits:
+            for hit in root_hits:
                 path = hit.path
 
-                if not self._is_path_in_sidebar_scope(path):
+                if not self._is_index_hit_in_sidebar_scope(path):
                     continue
 
-                key = str(path.resolve(strict=False))
+                key = str(path).casefold()
                 if key in seen:
                     continue
 
                 seen.add(key)
-                paths.append(path)
+                hits.append(hit)
 
-        paths.sort(key=lambda p: (0 if p.is_dir() else 1, str(p).casefold()))
-        return paths[:limit]
+        hits.sort(key=lambda hit: (0 if hit.is_dir else 1, str(hit.path).casefold()))
+        return hits[:limit]
 
     def reapply_current_search(self) -> None:
         if self.search_edit.text().strip():
@@ -1209,7 +1363,12 @@ class RootExplorerWidget(QWidget):
 
         self._navigate_to_path(path)
 
-    def _search_result_display_text(self, path: Path) -> str:
+    def _search_result_display_text(
+        self,
+        path: Path,
+        *,
+        is_dir: bool | None = None,
+    ) -> str:
         base_dir = self._search_scope_dir()
 
         try:
@@ -1221,23 +1380,33 @@ class RootExplorerWidget(QWidget):
         if not rel_text:
             rel_text = path.name or str(path)
 
-        prefix = "📁" if path.is_dir() else "📄"
+        if is_dir is None:
+            is_dir = path.is_dir()
+
+        prefix = "📁" if is_dir else "📄"
         return f"{prefix} {rel_text}"
 
     # --- Результаты поиска и навигация к найденным путям в дереве ---
-    def _populate_search_results(self, paths: list[Path]) -> None:
+    def _populate_search_status(self, text: str) -> None:
+        self.search_results.clear()
+        item = QListWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+        self.search_results.addItem(item)
+        self.search_results.setVisible(True)
+        self._update_search_results_height()
+
+    def _populate_search_results(self, hits: list[FileTreeIndexHit]) -> None:
         self.search_results.clear()
 
-        if not paths:
-            item = QListWidgetItem("Ничего не найдено")
-            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
-            self.search_results.addItem(item)
-            self.search_results.setVisible(True)
-            self._update_search_results_height()
+        if not hits:
+            self._populate_search_status("Ничего не найдено")
             return
 
-        for path in paths:
-            item = QListWidgetItem(self._search_result_display_text(path))
+        for hit in hits:
+            path = hit.path
+            item = QListWidgetItem(
+                self._search_result_display_text(path, is_dir=hit.is_dir)
+            )
             item.setData(Qt.UserRole, str(path))
             self.search_results.addItem(item)
 
@@ -1367,7 +1536,7 @@ class RootExplorerWidget(QWidget):
 
         self._prime_tree_path_for_navigation(path)
 
-        index = self._tree_index_for_path(path)
+        index = self._exact_tree_index_for_path(path)
         if not index.isValid():
             if self._schedule_pending_navigation_retry(path):
                 return
@@ -1384,7 +1553,8 @@ class RootExplorerWidget(QWidget):
         self._cancel_pending_navigation()
 
         def apply_focus_and_scroll():
-            if not index.isValid():
+            current_index = self._exact_tree_index_for_path(path)
+            if not current_index.isValid():
                 return
 
             # Уводим фокус со списка результатов обратно в дерево.
@@ -1392,11 +1562,11 @@ class RootExplorerWidget(QWidget):
             self.search_results.clearFocus()
 
             # Выделяем найденный элемент в дереве.
-            self.tree.setCurrentIndex(index)
+            self.tree.setCurrentIndex(current_index)
 
             # Стараемся показать найденный элемент ближе к началу viewport.
-            self.tree.scrollTo(index, QAbstractItemView.PositionAtCenter)
-            rect = self.tree.visualRect(index)
+            self.tree.scrollTo(current_index, QAbstractItemView.PositionAtCenter)
+            rect = self.tree.visualRect(current_index)
             if rect.isValid():
                 hbar = self.tree.horizontalScrollBar()
                 hbar.setValue(
@@ -1899,8 +2069,6 @@ class RootExplorerWidget(QWidget):
                 return
 
             base_dir = self._search_scope_dir()
-            if not base_dir.exists() or not base_dir.is_dir():
-                base_dir = self._root_dir
 
             # Indexed-mode: быстрый поиск по локальному SQLite-индексу.
             if self._can_use_indexed_search():
@@ -1909,13 +2077,24 @@ class RootExplorerWidget(QWidget):
 
                 self._search_mode = "indexed"
 
-                paths = self._indexed_search_paths(
+                hits = self._indexed_search_paths(
                     text=text,
                     base_dir=base_dir,
                     limit=100,
                 )
-                self._populate_search_results(paths)
+                self._populate_search_results(hits)
                 return
+
+            if self._index_build_in_progress:
+                self._clear_search_results()
+                self._search_mode = "indexed"
+                self._populate_search_status(
+                    "Локальный индекс обновляется. Поиск будет доступен после завершения."
+                )
+                return
+
+            if not base_dir.exists() or not base_dir.is_dir():
+                base_dir = self._root_dir
 
             # Legacy-mode: прямой обход дерева и сетевых каталогов.
             self._clear_search_results()
@@ -1937,7 +2116,7 @@ class RootExplorerWidget(QWidget):
             self._search_applying = False
 
     # --- Файловые операции проводника: inline rename, drag&drop и контекстное меню ---
-    def _get_default_open_dialog_dir(self) -> Path:
+    def _default_dialog_dir(self) -> Path:
         try:
             prefs = load_effective_app_preferences()
             dialog_dir = prefs.dialog_dir
@@ -2030,8 +2209,536 @@ class RootExplorerWidget(QWidget):
 
         return Path(self.model.filePath(source_index))
 
+    def _selected_paths_for_export(self) -> list[Path]:
+        path = self._path_from_index(self.tree.currentIndex())
+        if path is None or not path.exists():
+            return []
+
+        return [path]
+
+    def _set_windows_shell_data_object_dword(
+        self,
+        data_object,
+        format_name: str,
+        value: int,
+    ) -> bool:
+        if data_object is None:
+            return False
+
+        try:
+            format_id = win32clipboard.RegisterClipboardFormat(format_name)
+            format_etc = (
+                format_id,
+                None,
+                pythoncom.DVASPECT_CONTENT,
+                -1,
+                pythoncom.TYMED_HGLOBAL,
+            )
+            medium = pythoncom.STGMEDIUM()
+            medium.set(
+                pythoncom.TYMED_HGLOBAL,
+                struct.pack("<I", int(value)),
+            )
+            data_object.SetData(format_etc, medium, True)
+            return True
+        except Exception:
+            return False
+
+    def _create_windows_shell_data_object(self, paths: list[Path]):
+        export_paths = self._normalized_export_paths(paths)
+        if not export_paths:
+            return None
+
+        try:
+            parent_path = export_paths[0].parent.resolve(strict=False)
+        except Exception:
+            parent_path = export_paths[0].parent
+
+        if not parent_path:
+            return None
+
+        child_names: list[str] = []
+        for path in export_paths:
+            try:
+                candidate_parent = path.parent.resolve(strict=False)
+            except Exception:
+                candidate_parent = path.parent
+
+            if candidate_parent != parent_path or not path.name:
+                return None
+
+            child_names.append(path.name)
+
+        try:
+            desktop = shell.SHGetDesktopFolder()
+            _eaten, parent_pidl, _attrs = desktop.ParseDisplayName(
+                0,
+                None,
+                str(parent_path),
+                0,
+            )
+            parent_folder = desktop.BindToObject(
+                parent_pidl,
+                None,
+                shell.IID_IShellFolder,
+            )
+            child_pidls = []
+            for name in child_names:
+                _child_eaten, child_pidl, _child_attrs = parent_folder.ParseDisplayName(
+                    0,
+                    None,
+                    name,
+                    0,
+                )
+                child_pidls.append(child_pidl)
+
+            data_object = shell.SHCreateDataObject(
+                parent_pidl,
+                child_pidls,
+                None,
+                pythoncom.IID_IDataObject,
+            )
+            self._set_windows_shell_data_object_dword(
+                data_object,
+                _WINDOWS_PREFERRED_DROP_EFFECT_FORMAT,
+                _WINDOWS_DROPEFFECT_COPY,
+            )
+            if self._requires_windows_untrusted_drag_drop(export_paths):
+                self._set_windows_shell_data_object_dword(
+                    data_object,
+                    _WINDOWS_UNTRUSTED_DRAG_DROP_FORMAT,
+                    _WINDOWS_URLACTION_SHELL_ENHANCED_DRAGDROP_SECURITY,
+                )
+            return data_object
+        except Exception:
+            return None
+
+    def _start_windows_shell_drag(self, paths: list[Path]) -> bool:
+        export_paths = self._normalized_export_paths(paths)
+        if not export_paths:
+            return False
+
+        ole_initialized = False
+        try:
+            ole_result = int(_WINDOWS_OLE32.OleInitialize(None))
+            if ole_result not in (_WINDOWS_S_OK, _WINDOWS_S_FALSE):
+                log_runtime_event(
+                    "warn",
+                    f"Explorer drag: OleInitialize завершился кодом 0x{ole_result & 0xFFFFFFFF:08X}.",
+                )
+                return False
+
+            ole_initialized = True
+            log_runtime_event(
+                "info",
+                (
+                    "Explorer drag start: "
+                    f"count={len(export_paths)}, first={export_paths[0]}"
+                ),
+            )
+
+            data_object = self._create_windows_shell_data_object(export_paths)
+            if data_object is None:
+                log_runtime_event(
+                    "warn",
+                    "Explorer drag: не удалось создать Windows Shell IDataObject.",
+                )
+                return False
+
+            data_object_address = _windows_com_object_address(data_object)
+            if _NATIVE_SHDRAGDROP_DISABLED:
+                log_runtime_event(
+                    "warn",
+                    "Explorer drag: SHDoDragDrop отключен переменной среды HLA_DISABLE_NATIVE_SHELL_DRAGDROP=1.",
+                )
+            elif data_object_address is not None:
+                drag_effect = ctypes.c_uint32(0)
+                window_handle = 0
+                try:
+                    window_handle = int(self.tree.viewport().winId())
+                except Exception:
+                    window_handle = 0
+
+                log_runtime_event(
+                    "debug",
+                    (
+                        "Explorer drag: используется shell32!SHDoDragDrop "
+                        f"(hwnd={window_handle}, data_object=0x{data_object_address:016X})."
+                    ),
+                )
+                drag_result = _WINDOWS_SH_DO_DRAG_DROP(
+                    window_handle,
+                    data_object_address,
+                    0,
+                    shellcon.DROPEFFECT_COPY,
+                    ctypes.byref(drag_effect),
+                )
+                log_runtime_event(
+                    "info",
+                    (
+                        "Explorer drag: SHDoDragDrop завершился "
+                        f"HRESULT=0x{drag_result & 0xFFFFFFFF:08X}, "
+                        f"effect={int(drag_effect.value)}."
+                    ),
+                )
+                if drag_result in (
+                    winerror.DRAGDROP_S_DROP,
+                    winerror.DRAGDROP_S_CANCEL,
+                ):
+                    return True
+            else:
+                log_runtime_event(
+                    "warn",
+                    "Explorer drag: не удалось извлечь COM-адрес IDataObject, используется fallback через pythoncom.DoDragDrop.",
+                )
+
+            drop_source = pythoncom.WrapObject(
+                _WindowsShellDropSource(),
+                pythoncom.IID_IDropSource,
+                pythoncom.IID_IDropSource,
+            )
+            log_runtime_event(
+                "debug",
+                "Explorer drag: используется fallback через pythoncom.DoDragDrop.",
+            )
+            pythoncom.DoDragDrop(
+                data_object,
+                drop_source,
+                shellcon.DROPEFFECT_COPY,
+            )
+            log_runtime_event(
+                "info",
+                "Explorer drag: pythoncom.DoDragDrop завершен успешно.",
+            )
+            return True
+        except Exception as exc:
+            log_runtime_exception(
+                "Ошибка Windows drag&drop из бокового проводника.",
+                exc,
+            )
+            return False
+        finally:
+            if ole_initialized:
+                try:
+                    _WINDOWS_OLE32.OleUninitialize()
+                except Exception as exc:
+                    log_runtime_exception(
+                        "Ошибка при завершении OLE после Explorer drag&drop.",
+                        exc,
+                    )
+
+    def _normalized_export_paths(self, paths: list[Path]) -> list[Path]:
+        seen: set[str] = set()
+        export_paths: list[Path] = []
+
+        for path in paths:
+            candidate = Path(path)
+            if not candidate.exists():
+                continue
+
+            key = str(candidate.resolve(strict=False))
+            if key in seen:
+                continue
+
+            seen.add(key)
+            export_paths.append(candidate)
+
+        return export_paths
+
+    def _set_internal_local_paths_mime(
+        self,
+        mime: QMimeData,
+        paths: list[Path],
+    ) -> None:
+        payload = "\n".join(str(path) for path in paths).encode("utf-8")
+        mime.setData(_INTERNAL_LOCAL_PATHS_MIME, payload)
+
+    def _mime_data_for_local_paths(
+        self,
+        paths: list[Path],
+        *,
+        include_urls: bool = False,
+    ) -> QMimeData | None:
+        export_paths = self._normalized_export_paths(paths)
+        if not export_paths:
+            return None
+
+        mime = QMimeData()
+        self._set_internal_local_paths_mime(mime, export_paths)
+
+        if include_urls:
+            mime.setUrls([QUrl.fromLocalFile(str(path)) for path in export_paths])
+
+        self._apply_windows_shell_export_metadata(mime, export_paths)
+        return mime
+
+    def _windows_native_mime_name(self, format_name: str) -> str:
+        return _WINDOWS_CLIPBOARD_MIME_TEMPLATE.format(name=format_name)
+
+    def _set_windows_shell_dword_mime(
+        self,
+        mime: QMimeData,
+        format_name: str,
+        value: int,
+    ) -> None:
+        mime.setData(
+            self._windows_native_mime_name(format_name),
+            struct.pack("<I", int(value)),
+        )
+
+    def _set_windows_shell_filename_w_mime(
+        self,
+        mime: QMimeData,
+        path: Path,
+    ) -> None:
+        # Для одиночного copy/paste Windows Explorer надёжнее работает,
+        # когда кроме URL-данных получает ещё и явный shell-формат пути.
+        payload = (str(path) + "\0").encode("utf-16le")
+        mime.setData(
+            self._windows_native_mime_name(_WINDOWS_FILENAME_W_FORMAT),
+            payload,
+        )
+
+    def _set_windows_shell_filename_mime(
+        self,
+        mime: QMimeData,
+        path: Path,
+    ) -> None:
+        try:
+            payload = (str(path) + "\0").encode("mbcs", errors="replace")
+        except LookupError:
+            return
+
+        mime.setData(
+            self._windows_native_mime_name(_WINDOWS_FILENAME_FORMAT),
+            payload,
+        )
+
+    def _windows_drive_type(self, path: Path) -> int | None:
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+
+        anchor = resolved.anchor
+        if not anchor:
+            return None
+
+        try:
+            return int(ctypes.windll.kernel32.GetDriveTypeW(str(anchor)))
+        except Exception:
+            if anchor.startswith("\\\\"):
+                return _WINDOWS_REMOTE_DRIVE_TYPE
+            return None
+
+    def _path_has_windows_zone_identifier(self, path: Path) -> bool:
+        try:
+            ads_path = f"{path}:Zone.Identifier"
+            with open(ads_path, encoding="utf-8", errors="ignore") as stream:
+                return "[ZoneTransfer]" in stream.read(256)
+        except OSError:
+            return False
+
+    def _requires_windows_untrusted_drag_drop(self, paths: list[Path]) -> bool:
+        for path in paths:
+            # Для сетевых путей и реального MOTW Explorer на части рабочих ПК
+            # запускает копирование корректно только когда shell получает
+            # явный marker ненадёжного источника и сам показывает свой prompt.
+            drive_type = self._windows_drive_type(path)
+            if drive_type == _WINDOWS_REMOTE_DRIVE_TYPE:
+                return True
+
+            if path.is_file() and self._path_has_windows_zone_identifier(path):
+                return True
+
+        return False
+
+    def _apply_windows_shell_export_metadata(
+        self,
+        mime: QMimeData,
+        paths: list[Path],
+    ) -> None:
+        # Для Ctrl+C / контекстного меню / drag-out Explorer ожидает явное
+        # указание, что источник предлагает именно копирование файлов.
+        self._set_windows_shell_dword_mime(
+            mime,
+            _WINDOWS_PREFERRED_DROP_EFFECT_FORMAT,
+            _WINDOWS_DROPEFFECT_COPY,
+        )
+
+        if len(paths) == 1:
+            self._set_windows_shell_filename_mime(mime, paths[0])
+            self._set_windows_shell_filename_w_mime(mime, paths[0])
+
+        # Для реального Mark of the Web shell должен получить маркер
+        # "ненадёжного" источника, чтобы Windows применила штатную защиту.
+        if self._requires_windows_untrusted_drag_drop(paths):
+            self._set_windows_shell_dword_mime(
+                mime,
+                _WINDOWS_UNTRUSTED_DRAG_DROP_FORMAT,
+                _WINDOWS_URLACTION_SHELL_ENHANCED_DRAGDROP_SECURITY,
+            )
+
+    def _local_paths_from_internal_mime_data(self, mime_data) -> list[Path]:
+        if mime_data is None or not mime_data.hasFormat(_INTERNAL_LOCAL_PATHS_MIME):
+            return []
+
+        try:
+            payload = bytes(mime_data.data(_INTERNAL_LOCAL_PATHS_MIME)).decode("utf-8")
+        except Exception:
+            return []
+
+        paths: list[Path] = []
+        for line in payload.splitlines():
+            text = line.strip()
+            if not text:
+                continue
+
+            path = Path(text)
+            if path.exists():
+                paths.append(path)
+
+        return paths
+
+    def _local_paths_from_mime_data(self, mime_data) -> list[Path]:
+        internal_paths = self._local_paths_from_internal_mime_data(mime_data)
+        if internal_paths:
+            return internal_paths
+
+        if mime_data is None or not mime_data.hasUrls():
+            return []
+
+        paths: list[Path] = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                return []
+
+            path = Path(url.toLocalFile())
+            if path.exists():
+                paths.append(path)
+
+        return paths
+
+    def _windows_clipboard_local_paths(self) -> list[Path]:
+        try:
+            win32clipboard.OpenClipboard()
+            if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
+                return []
+
+            raw_paths = win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
+        except Exception:
+            return []
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+
+        paths: list[Path] = []
+        for raw_path in raw_paths:
+            path = Path(raw_path)
+            if path.exists():
+                paths.append(path)
+
+        return paths
+
+    def _clipboard_local_paths(self) -> list[Path]:
+        paths = self._local_paths_from_mime_data(QApplication.clipboard().mimeData())
+        if paths:
+            return paths
+
+        return self._windows_clipboard_local_paths()
+
+    def _build_windows_hdrop_payload(self, paths: list[Path]) -> bytes:
+        names = "".join(str(path) + "\0" for path in paths) + "\0"
+        names_bytes = names.encode("utf-16le")
+        dropfiles_header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+        return dropfiles_header + names_bytes
+
+    def _copy_paths_to_windows_clipboard(self, paths: list[Path]) -> bool:
+        export_paths = self._normalized_export_paths(paths)
+        if not export_paths:
+            return False
+
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(
+                win32clipboard.CF_HDROP,
+                self._build_windows_hdrop_payload(export_paths),
+            )
+            win32clipboard.SetClipboardData(
+                win32clipboard.RegisterClipboardFormat(
+                    _WINDOWS_PREFERRED_DROP_EFFECT_FORMAT
+                ),
+                struct.pack("<I", _WINDOWS_DROPEFFECT_COPY),
+            )
+
+            if len(export_paths) == 1:
+                single_path = export_paths[0]
+                try:
+                    filename_payload = (str(single_path) + "\0").encode(
+                        "mbcs",
+                        errors="replace",
+                    )
+                except LookupError:
+                    filename_payload = None
+
+                if filename_payload is not None:
+                    win32clipboard.SetClipboardData(
+                        win32clipboard.RegisterClipboardFormat(
+                            _WINDOWS_FILENAME_FORMAT
+                        ),
+                        filename_payload,
+                    )
+
+                win32clipboard.SetClipboardData(
+                    win32clipboard.RegisterClipboardFormat(_WINDOWS_FILENAME_W_FORMAT),
+                    (str(single_path) + "\0").encode("utf-16le"),
+                )
+
+            if self._requires_windows_untrusted_drag_drop(export_paths):
+                win32clipboard.SetClipboardData(
+                    win32clipboard.RegisterClipboardFormat(
+                        _WINDOWS_UNTRUSTED_DRAG_DROP_FORMAT
+                    ),
+                    struct.pack(
+                        "<I",
+                        _WINDOWS_URLACTION_SHELL_ENHANCED_DRAGDROP_SECURITY,
+                    ),
+                )
+
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+
+    def _copy_paths_to_clipboard(self, paths: list[Path]) -> bool:
+        if self._copy_paths_to_windows_clipboard(paths):
+            return True
+
+        mime = self._mime_data_for_local_paths(paths)
+        if mime is None:
+            return False
+
+        QApplication.clipboard().setMimeData(mime)
+        return True
+
+    def _copy_selected_paths_to_clipboard(self) -> bool:
+        return self._copy_paths_to_clipboard(self._selected_paths_for_export())
+
     def _run_after_menu_close(self, callback: Callable[[], None]) -> None:
         QTimer.singleShot(0, callback)
+
+    def _target_dir_for_path(self, path: Path | None) -> Path:
+        if path is None:
+            return self._root_dir
+
+        return path if path.is_dir() else path.parent
 
     def _expand_path_chain(self, path: Path) -> None:
         target_dir = path if path.is_dir() else path.parent
@@ -2058,7 +2765,7 @@ class RootExplorerWidget(QWidget):
     def _select_path_in_tree(self, path: Path) -> None:
         self._expand_path_chain(path)
 
-        index = self._tree_index_for_path(path)
+        index = self._exact_tree_index_for_path(path)
         if not index.isValid():
             return
 
@@ -2227,19 +2934,22 @@ class RootExplorerWidget(QWidget):
         act_reveal = menu.addAction(
             "Показать в проводнике" if path.is_file() else "Открыть в проводнике"
         )
+        act_copy = menu.addAction("Копировать") if clicked_path is not None else None
 
         menu.addSeparator()
 
         act_refresh = menu.addAction("Обновить")
 
-        target_dir = path if path.is_dir() else path.parent
+        target_dir = self._target_dir_for_path(path)
 
         can_manage_children, _ = self._can_manage_children_in(target_dir)
         path_protected, _ = self._is_protected_path(
             path,
             is_dir_hint=path.is_dir(),
         )
+        clipboard_paths = self._clipboard_local_paths()
 
+        act_paste = None
         act_add_files = None
         act_new_folder = None
         act_rename = None
@@ -2247,6 +2957,8 @@ class RootExplorerWidget(QWidget):
 
         if target_dir.exists() and can_manage_children:
             menu.addSeparator()
+            if clipboard_paths:
+                act_paste = menu.addAction("Вставить")
             act_add_files = menu.addAction("Добавить файлы...")
             act_new_folder = menu.addAction("Создать папку...")
 
@@ -2265,9 +2977,22 @@ class RootExplorerWidget(QWidget):
                 lambda p=p: self._reveal_in_system(p)
             )
         )
+        if act_copy is not None:
+            act_copy.triggered.connect(
+                lambda _checked=False, p=path: self._run_after_menu_close(
+                    lambda p=p: self._copy_paths_to_clipboard([p])
+                )
+            )
         act_refresh.triggered.connect(
             lambda _checked=False: self._run_after_menu_close(self.refresh)
         )
+
+        if act_paste is not None:
+            act_paste.triggered.connect(
+                lambda _checked=False, td=target_dir: self._run_after_menu_close(
+                    lambda td=td: self._paste_from_clipboard(td)
+                )
+            )
 
         if act_add_files is not None:
             act_add_files.triggered.connect(
@@ -2475,16 +3200,20 @@ class RootExplorerWidget(QWidget):
     def _drop_target_dir_for_pos(self, pos) -> Path | None:
         index = self.tree.indexAt(pos)
         path = self._path_from_index(index)
+        return self._target_dir_for_path(path)
 
-        if path is None:
-            return self._root_dir
+    def _current_paste_target_dir(self) -> Path:
+        return self._target_dir_for_path(
+            self._path_from_index(self.tree.currentIndex())
+        )
 
-        return path if path.is_dir() else path.parent
-
-    def _handle_external_drop(
+    def _copy_external_paths_to_target_dir(
         self,
         source_paths: list[Path],
         target_dir: Path,
+        *,
+        operation_name: str,
+        error_title: str,
     ) -> bool:
         allowed, reason = self._can_manage_children_in(target_dir)
         if not allowed:
@@ -2502,9 +3231,7 @@ class RootExplorerWidget(QWidget):
         failed: list[str] = []
 
         try:
-            with acquire_shared_write_lock(
-                operation_name="добавление файлов перетаскиванием"
-            ):
+            with acquire_shared_write_lock(operation_name=operation_name):
                 for src in source_paths:
                     dst = target_dir / src.name
                     self._copy_incoming_path(src, dst, copied, skipped, failed)
@@ -2514,28 +3241,84 @@ class RootExplorerWidget(QWidget):
         except Exception as e:
             QMessageBox.warning(
                 self,
-                "Операция не выполнена",
+                error_title,
                 f"{e}",
             )
             return False
 
+        self._finalize_added_paths(copied)
+
+        self._show_copy_summary_message(
+            copied=copied,
+            skipped=skipped,
+            failed=failed,
+            include_copied=True,
+        )
+
+        return True
+
+    def _finalize_added_paths(self, copied: list[str]) -> None:
         self.refresh()
 
-        if copied:
-            self._request_index_rebuild()
+        if not copied:
+            return
 
+        self._request_index_rebuild()
+        self._select_path_in_tree(Path(copied[0]))
+
+    def _show_copy_summary_message(
+        self,
+        *,
+        copied: list[str],
+        skipped: list[str],
+        failed: list[str],
+        include_copied: bool,
+    ) -> None:
         parts: list[str] = []
-        if copied:
+        if include_copied and copied:
             parts.append("Добавлены:\n" + "\n".join(copied))
         if skipped:
             parts.append("Пропущены:\n" + "\n".join(skipped))
         if failed:
             parts.append("Ошибки:\n" + "\n".join(failed))
 
-        if parts:
-            QMessageBox.information(self, "Готово", "\n\n".join(parts))
+        if not parts:
+            return
 
-        return True
+        if failed:
+            title = (
+                "Операция выполнена не полностью"
+                if copied or skipped
+                else "Операция не выполнена"
+            )
+            QMessageBox.warning(self, title, "\n\n".join(parts))
+            return
+
+        QMessageBox.information(self, "Готово", "\n\n".join(parts))
+
+    def _paste_from_clipboard(self, target_dir: Path) -> bool:
+        source_paths = self._clipboard_local_paths()
+        if not source_paths:
+            return False
+
+        return self._copy_external_paths_to_target_dir(
+            source_paths,
+            target_dir,
+            operation_name="вставка из буфера обмена",
+            error_title="Не удалось вставить",
+        )
+
+    def _handle_external_drop(
+        self,
+        source_paths: list[Path],
+        target_dir: Path,
+    ) -> bool:
+        return self._copy_external_paths_to_target_dir(
+            source_paths,
+            target_dir,
+            operation_name="добавление файлов перетаскиванием",
+            error_title="Операция не выполнена",
+        )
 
     def _copy_incoming_path(
         self,
@@ -2684,7 +3467,7 @@ class RootExplorerWidget(QWidget):
             self._warn_protected(target_dir, reason)
             return
 
-        start_dir = self._get_default_open_dialog_dir()
+        start_dir = self._default_dialog_dir()
 
         file_names, _ = QFileDialog.getOpenFileNames(
             self,
@@ -2771,22 +3554,14 @@ class RootExplorerWidget(QWidget):
             )
             return
 
-        self.refresh()
+        self._finalize_added_paths(copied)
 
-        if copied:
-            self._request_index_rebuild()
-
-            first_copied_path = Path(copied[0])
-            self._select_path_in_tree(first_copied_path)
-
-        parts: list[str] = []
-        if skipped:
-            parts.append("Пропущены:\n" + "\n".join(skipped))
-        if failed:
-            parts.append("Ошибки:\n" + "\n".join(failed))
-
-        if parts:
-            QMessageBox.information(self, "Готово", "\n\n".join(parts))
+        self._show_copy_summary_message(
+            copied=copied,
+            skipped=skipped,
+            failed=failed,
+            include_copied=False,
+        )
 
     def _create_folder(self, parent_dir: Path) -> None:
         allowed, reason = self._can_manage_children_in(parent_dir)

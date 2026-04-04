@@ -18,6 +18,7 @@ from hla_app.services.conclusion_service import (
     normalize_staff_name,
     suggest_conclusion_filename,
 )
+from hla_app.utils.validators import is_positive_int_text_without_leading_zero
 
 # --- Названия учреждений для шапки заключения ---
 
@@ -97,8 +98,11 @@ def build_conclusion_payload(
         raise ValueError("Для заключения заполните Имя.")
 
     num_register_text = (num_register_text or "").strip()
-    if not num_register_text.isdigit():
-        raise ValueError("Поле «№ по журналу» должно быть заполнено (только цифры).")
+    if not is_positive_int_text_without_leading_zero(num_register_text):
+        raise ValueError(
+            "Поле «№ по журналу» должно быть заполнено "
+            "(только цифры, без начального 0)."
+        )
     num_register = int(num_register_text)
 
     if clinic is None:

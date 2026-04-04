@@ -31,7 +31,19 @@ Runtime dependencies intended for redistribution
    If you change the PySide6 version or the set of Qt modules, review and
    refresh the bundled notices before release.
 
-2) psycopg2-binary 2.9.11
+2) pyqtgraph
+   License: MIT License
+   Upstream:
+   - https://github.com/pyqtgraph/pyqtgraph
+   Purpose in this project:
+   - Interactive plotting for the antibody dynamics window.
+   Bundle with distribution:
+   - licenses/pyqtgraph-MIT.txt
+   Notes:
+   - Before preparing a release bundle, verify that the bundled notice
+     corresponds to the exact pyqtgraph version used for that release.
+
+3) psycopg2-binary 2.9.11
    License: LGPL with exceptions
    The Windows binary wheel also bundles native runtime libraries such as:
    - libpq (PostgreSQL client library)
@@ -41,48 +53,48 @@ Runtime dependencies intended for redistribution
    - licenses/PostgreSQL-License.txt
    - licenses/Apache-2.0.txt
 
-3) SQLAlchemy 2.0.48
+4) SQLAlchemy 2.0.48
    License: MIT License
    Bundle with distribution:
    - licenses/SQLAlchemy-MIT.txt
 
-4) pandas 3.0.1
+5) pandas 3.0.1
    License: BSD 3-Clause License
    Bundle with distribution:
    - licenses/pandas-BSD-3-Clause.txt
 
-5) numpy 2.4.3
+6) numpy 2.4.3
    License: BSD-style license with bundled third-party notices in the wheel
    (for example, OpenBLAS/LAPACK/GCC runtime notices)
    Bundle with distribution:
    - licenses/numpy-LICENSE.txt
 
-6) python-dateutil 2.9.0.post0
+7) python-dateutil 2.9.0.post0
    License: dual-license notice (BSD + Apache-2.0 re-licensed portions)
    Bundle with distribution:
    - licenses/python-dateutil-LICENSE.txt
 
-7) tzdata 2025.3
+8) tzdata 2025.3
    License: Apache License 2.0
    Bundle with distribution:
    - licenses/Apache-2.0.txt
 
-8) openpyxl 3.1.5
+9) openpyxl 3.1.5
    License: MIT License
    Bundle with distribution:
    - licenses/openpyxl-MIT.txt
 
-9) et_xmlfile 2.0.0
+10) et_xmlfile 2.0.0
    License: MIT License
    Bundle with distribution:
    - licenses/et_xmlfile-MIT.txt
 
-10) python-docx 1.2.0
+11) python-docx 1.2.0
     License: MIT License
     Bundle with distribution:
     - licenses/python-docx-MIT.txt
 
-11) lxml 6.0.2
+12) lxml 6.0.2
     License: BSD 3-Clause License
     Additional upstream notices are included by the wheel for bundled or
     referenced components.
@@ -90,12 +102,12 @@ Runtime dependencies intended for redistribution
     - licenses/lxml-BSD-3-Clause.txt
     - licenses/lxml-additional-notices.txt
 
-12) six 1.17.0
+13) six 1.17.0
     License: MIT License
     Bundle with distribution:
     - licenses/six-MIT.txt
 
-13) pywin32
+14) pywin32
     PyPI metadata:
     - License: Python Software Foundation License (PSF)
     Purpose in this project:

@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import gc
+import locale
 import os
 import subprocess
 import sys
@@ -35,9 +37,10 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QFontMetrics,
+    QGuiApplication,
     QIcon,
-    QIntValidator,
     QRegularExpressionValidator,
+    QValidator,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -96,6 +99,7 @@ from hla_app.config.managed_files import CONCLUSION_FILE_NAMES, class_result_fil
 from hla_app.config.settings import (
     APP_PASSWORD,
     FIRST_CLINIC,
+    INPUT_LANGUAGE_ID,
     ORGANS,
     REBUILD_FILE_TREE_INDEX_ON_STARTUP,
     SECOND_CLINIC,
@@ -104,11 +108,15 @@ from hla_app.config.settings import (
 )
 from hla_app.data.luminex_parser import parse_luminex_csv
 from hla_app.db.engine import probe_db_settings
+from hla_app.services.antibody_dynamics_models import PatientLookupInput
+from hla_app.services.antibody_dynamics_service import (
+    resolve_primary_patient_for_dynamics,
+)
 from hla_app.services.app_prefs import (
     load_effective_app_preferences,
     save_explorer_visibility_preference,
 )
-from hla_app.services.avg_service import DEFAULT_AVG_MIN_TITER, build_avg_excels
+from hla_app.services.avg_service import build_avg_excels
 from hla_app.services.conclusion_pdf_conversion import convert_word_document_to_pdf
 from hla_app.services.conclusion_service import normalize_staff_name
 from hla_app.services.conclusion_workflow import (
@@ -157,9 +165,17 @@ from hla_app.storage.fs_ops import (
 from hla_app.storage.fs_ops import (
     delete_dir_tree as fs_delete_dir_tree,
 )
+from hla_app.ui.dialogs.antibody_dynamics_patient_pick_dialog import (
+    AntibodyDynamicsPatientPickDialog,
+)
+from hla_app.ui.dialogs.antibody_dynamics_settings_popup import (
+    AntibodyDynamicsSettingsPopup,
+)
+from hla_app.ui.dialogs.antibody_dynamics_window import AntibodyDynamicsWindow
 from hla_app.ui.dialogs.match_dialog import MatchDialogAny
 from hla_app.ui.dialogs.settings_dialog import AppSettingsDialog
 from hla_app.ui.widgets.date_input import DateInput
+from hla_app.ui.widgets.min_titer_input import MinTiterLineEdit
 from hla_app.ui.widgets.root_explorer import (
     EXPLORER_AVG_WIDTH,
     EXPLORER_MAX_WIDTH,
@@ -170,6 +186,7 @@ from hla_app.ui.workers.file_index_worker import FileTreeIndexBuildTask
 from hla_app.utils.validators import (
     cap_hyphenated_fio_part,
     format_ddmmyyyy,
+    is_positive_int_text_without_leading_zero,
     is_valid_ru_fio,
     normalize_for_compare,
 )
@@ -241,6 +258,37 @@ class MainSplitter(QSplitter):
         return MainSplitterHandle(self.orientation(), self)
 
 
+class NoLeadingZeroIntValidator(QValidator):
+    """Только цифры, без ведущего нуля, в заданном числовом диапазоне."""
+
+    def __init__(self, minimum: int, maximum: int, parent=None):
+        super().__init__(parent)
+        self._minimum = int(minimum)
+        self._maximum = int(maximum)
+        self._max_length = len(str(self._maximum))
+
+    def validate(self, input_str: str, pos: int):
+        text = input_str or ""
+
+        if text == "":
+            return QValidator.Intermediate, input_str, pos
+
+        if not text.isdigit():
+            return QValidator.Invalid, input_str, pos
+
+        if text.startswith("0"):
+            return QValidator.Invalid, input_str, pos
+
+        if len(text) > self._max_length:
+            return QValidator.Invalid, input_str, pos
+
+        value = int(text)
+        if value < self._minimum or value > self._maximum:
+            return QValidator.Invalid, input_str, pos
+
+        return QValidator.Acceptable, input_str, pos
+
+
 # --- Главное окно и вся оркестрация пользовательских сценариев ---
 class MainWindow(QMainWindow):
     def __init__(self, *, root_dir_available: bool = True):
@@ -267,6 +315,8 @@ class MainWindow(QMainWindow):
         self._temporary_conclusion_pdf_path: Path | None = None
         self.avg_csv_paths: list[Path] = []
         self._import_in_progress = False
+        self._antibody_dynamics_window = None
+        self._antibody_dynamics_settings_popup = None
 
         # --- Корневой layout и связка проводника с правой рабочей областью ---
         root = QWidget()
@@ -535,13 +585,6 @@ class MainWindow(QMainWindow):
         self.first_name.editingFinished.connect(self._normalize_names)
         self.middle_name.editingFinished.connect(self._normalize_names)
 
-        self.sex = QComboBox()
-        self.sex.addItem("жен.", "f")
-        self.sex.addItem("муж.", "m")
-        self.sex.setCurrentIndex(-1)
-        self.sex.setPlaceholderText("Укажите пол")
-        form.addRow("Пол:", self.sex)
-
         self.birth_date = DateInput(
             min_date=get_date_min_birth(),
             max_date=today,
@@ -550,9 +593,16 @@ class MainWindow(QMainWindow):
         )
         form.addRow("Дата рождения:", self.birth_date)
 
+        self.sex = QComboBox()
+        self.sex.addItem("жен.", "f")
+        self.sex.addItem("муж.", "m")
+        self.sex.setCurrentIndex(-1)
+        self.sex.setPlaceholderText("Укажите пол")
+        form.addRow("Пол:", self.sex)
+
         self.recipient_code = QLineEdit()
         self.recipient_code.setValidator(
-            QIntValidator(0, 2_147_483_647, self.recipient_code)
+            NoLeadingZeroIntValidator(1, 2_147_483_647, self.recipient_code)
         )
         self.recipient_code.setToolTip("Первичный код реципиента в листе ожидания")
 
@@ -564,6 +614,10 @@ class MainWindow(QMainWindow):
         self.btn_antibody_dynamics_settings.setAutoRaise(True)
         self.btn_antibody_dynamics_settings.setCursor(Qt.PointingHandCursor)
         self.btn_antibody_dynamics_settings.setStyleSheet(tool_icon_button_style)
+        self.btn_antibody_dynamics.clicked.connect(self._open_antibody_dynamics_window)
+        self.btn_antibody_dynamics_settings.clicked.connect(
+            self._toggle_antibody_dynamics_settings_popup
+        )
 
         recipient_code_row = QWidget()
         recipient_code_row_layout = QHBoxLayout(recipient_code_row)
@@ -811,7 +865,7 @@ class MainWindow(QMainWindow):
 
         self.concl_num_register = QLineEdit()
         self.concl_num_register.setValidator(
-            QIntValidator(0, 10**9, self.concl_num_register)
+            NoLeadingZeroIntValidator(1, 10**5, self.concl_num_register)
         )
         concl_form.addRow("№ по журналу:", self.concl_num_register)
 
@@ -906,17 +960,11 @@ class MainWindow(QMainWindow):
         threshold_layout.setSpacing(6)
 
         lbl_avg_threshold = QLabel("Нижний порог чувствительности:")
-        self.ed_avg_min_titer = QLineEdit()
-        self.ed_avg_min_titer.setValidator(
-            QIntValidator(0, 10**9, self.ed_avg_min_titer)
-        )
-        self.ed_avg_min_titer.setPlaceholderText(str(DEFAULT_AVG_MIN_TITER))
-        self.ed_avg_min_titer.setAlignment(Qt.AlignCenter)
-        self.ed_avg_min_titer.setFixedWidth(120)
+        self.ed_avg_min_titer = MinTiterLineEdit(self)
 
         threshold_layout.addStretch(1)
         threshold_layout.addWidget(lbl_avg_threshold)
-        threshold_layout.addWidget(self.ed_avg_min_titer)
+        threshold_layout.addWidget(self.ed_avg_min_titer, 1)
         threshold_layout.addStretch(1)
 
         hb_avg = QHBoxLayout()
@@ -929,6 +977,9 @@ class MainWindow(QMainWindow):
         self.btn_avg_cancel = QPushButton("Отмена")
 
         self.ed_avg_min_titer.returnPressed.connect(self._confirm_avg_threshold_input)
+        self.ed_avg_min_titer.emptyReturnPressed.connect(
+            self._confirm_avg_threshold_input
+        )
 
         hb_avg.addStretch(1)
         hb_avg.addWidget(self.btn_avg_pick)
@@ -968,10 +1019,42 @@ class MainWindow(QMainWindow):
         self.status = QLabel("")
         self.status.setWordWrap(True)
         self.status.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.status.setMinimumHeight(_STATUS_LABEL_MIN_HEIGHT)
         self.status.setMaximumHeight(_STATUS_LABEL_MAX_HEIGHT)
-        v.addWidget(self.status, 0)
+
+        self.lbl_keyboard_layout = QLabel("")
+        self.lbl_keyboard_layout.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.lbl_keyboard_layout.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Maximum)
+        self.lbl_keyboard_layout.setMinimumHeight(_STATUS_LABEL_MIN_HEIGHT)
+        self.lbl_keyboard_layout.setMaximumHeight(_STATUS_LABEL_MAX_HEIGHT)
+        self.lbl_keyboard_layout.setMinimumWidth(
+            self.fontMetrics().horizontalAdvance("BE") + 12
+        )
+        self.lbl_keyboard_layout.setToolTip("Текущая раскладка клавиатуры")
+        self.lbl_keyboard_layout.setStyleSheet("color: #555555;")
+
+        status_row = QWidget()
+        status_row_layout = QHBoxLayout(status_row)
+        status_row_layout.setContentsMargins(0, 0, 0, 0)
+        status_row_layout.setSpacing(8)
+        status_row_layout.addWidget(self.status, 1)
+        status_row_layout.addWidget(self.lbl_keyboard_layout, 0)
+        v.addWidget(status_row, 0)
+
+        self._keyboard_layout_timer = QTimer(self)
+        self._keyboard_layout_timer.setInterval(300)
+        self._keyboard_layout_timer.timeout.connect(
+            self._update_keyboard_layout_indicator
+        )
+        self._keyboard_layout_timer.start()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_app_focus_changed)
+
+        self._activate_keyboard_layout_if_available()
+        QTimer.singleShot(0, self._update_keyboard_layout_indicator)
 
         self._set_root_dir_available_state(
             available=self._root_dir_available,
@@ -1070,6 +1153,58 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, self.center_on_screen)
 
+    def _resolve_keyboard_layout_label(self) -> str:
+        if os.name != "nt":
+            return ""
+
+        try:
+            hkl = ctypes.windll.user32.GetKeyboardLayout(0)
+            lang_id = int(hkl) & 0xFFFF
+            locale_name = locale.windows_locale.get(lang_id, "")
+            if not locale_name:
+                return ""
+
+            language_code = locale_name.split("_", 1)[0].upper()
+            if len(language_code) == 2:
+                return language_code
+
+            return language_code[:3]
+        except Exception:
+            return ""
+
+    def _activate_keyboard_layout_if_available(self) -> None:
+        if os.name != "nt":
+            return
+
+        try:
+            user32 = ctypes.windll.user32
+            layout_count = int(user32.GetKeyboardLayoutList(0, None))
+            if layout_count <= 0:
+                return
+
+            layout_buffer = (ctypes.c_void_p * layout_count)()
+            loaded_count = int(
+                user32.GetKeyboardLayoutList(layout_count, layout_buffer)
+            )
+
+            for hkl in layout_buffer[:loaded_count]:
+                hkl_value = int(hkl or 0)
+                if (hkl_value & 0xFFFF) != INPUT_LANGUAGE_ID:
+                    continue
+
+                user32.ActivateKeyboardLayout(ctypes.c_void_p(hkl_value), 0)
+                return
+        except Exception:
+            return
+
+    def _update_keyboard_layout_indicator(self) -> None:
+        text = self._resolve_keyboard_layout_label()
+        self.lbl_keyboard_layout.setText(text)
+        self.lbl_keyboard_layout.setVisible(bool(text))
+
+    def _on_app_focus_changed(self, _old, _new) -> None:
+        self._update_keyboard_layout_indicator()
+
     def closeEvent(self, event) -> None:
         if self._import_in_progress:
             QMessageBox.warning(
@@ -1082,6 +1217,14 @@ class MainWindow(QMainWindow):
             return
 
         self._cleanup_temporary_conclusion_pdf()
+
+        if self._antibody_dynamics_settings_popup is not None:
+            self._antibody_dynamics_settings_popup.close()
+            self._antibody_dynamics_settings_popup = None
+
+        if self._antibody_dynamics_window is not None:
+            self._antibody_dynamics_window.close()
+            self._antibody_dynamics_window = None
 
         super().closeEvent(event)
 
@@ -1118,6 +1261,14 @@ class MainWindow(QMainWindow):
             self._apply_default_clinic_from_prefs()
             self._refresh_root_dir_availability()
 
+            if self._antibody_dynamics_settings_popup is not None:
+                self._antibody_dynamics_settings_popup.close()
+                self._antibody_dynamics_settings_popup = None
+
+            if self._antibody_dynamics_window is not None:
+                self._antibody_dynamics_window.close()
+                self._antibody_dynamics_window = None
+
     def show_about_dialog(self) -> None:
         QMessageBox.information(
             self,
@@ -1152,6 +1303,29 @@ class MainWindow(QMainWindow):
                 "PostgreSQL недоступен",
                 "Не удалось подключиться к базе данных PostgreSQL.\n\n"
                 "Импорт не будет выполнен.\n"
+                "Проверьте параметры подключения в окне «Настройки».\n\n"
+                f"{e}",
+            )
+            return False
+
+    def _ensure_postgres_available_for_dynamics(self) -> bool:
+        prefs = load_effective_app_preferences()
+
+        try:
+            probe_db_settings(
+                db_user=prefs.db_user,
+                db_password=prefs.db_password,
+                db_host=prefs.db_host,
+                db_port=prefs.db_port,
+                db_name=prefs.db_name,
+            )
+            return True
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "PostgreSQL недоступен",
+                "Не удалось подключиться к базе данных PostgreSQL.\n\n"
+                "Окно динамики антител не будет открыто.\n"
                 "Проверьте параметры подключения в окне «Настройки».\n\n"
                 f"{e}",
             )
@@ -1312,9 +1486,12 @@ class MainWindow(QMainWindow):
         if not self._wait_for_file_tree_index_build_to_finish():
             return False
 
-        if not self._wait_for_patient_autocomplete_tasks_to_finish():
-            return False
+        return self._prepare_ui_for_critical_file_operation()
 
+    def _restore_ui_after_patient_dir_rename(self) -> None:
+        self._restore_ui_after_critical_file_operation()
+
+    def _suspend_root_explorer_for_critical_file_operation(self) -> None:
         if self._root_dir_available:
             try:
                 self.root_explorer.suspend_filesystem_model()
@@ -1322,9 +1499,8 @@ class MainWindow(QMainWindow):
                 pass
 
         self._release_pending_fs_handles()
-        return True
 
-    def _restore_ui_after_patient_dir_rename(self) -> None:
+    def _restore_ui_after_critical_file_operation(self) -> None:
         if self._root_dir_available:
             try:
                 self.root_explorer.resume_filesystem_model()
@@ -1332,6 +1508,13 @@ class MainWindow(QMainWindow):
                 pass
 
         self._process_non_input_events()
+
+    def _prepare_ui_for_critical_file_operation(self) -> bool:
+        if not self._wait_for_patient_autocomplete_tasks_to_finish():
+            return False
+
+        self._suspend_root_explorer_for_critical_file_operation()
+        return True
 
     def _resume_file_tree_index_updates_after_import(self) -> None:
         """
@@ -1920,6 +2103,9 @@ class MainWindow(QMainWindow):
         if not recipient_code_text:
             return
 
+        if not is_positive_int_text_without_leading_zero(recipient_code_text):
+            return
+
         if not self._root_dir_available:
             self._warn(
                 "Файловая база недоступна.\n\n"
@@ -1998,6 +2184,161 @@ class MainWindow(QMainWindow):
         self._fill_patient_fields_from_folder(parsed)
         self.recipient_code.setText(recipient_code_text)
 
+    # --- Окно динамики антител и popup дополнительной PostgreSQL ---
+    def _build_dynamics_lookup_input(self) -> PatientLookupInput:
+        recipient_code_text = self.recipient_code.text().strip()
+        recipient_code = int(recipient_code_text) if recipient_code_text else None
+        dynamics_patient_code = None
+
+        locked_patient_dir = self._get_locked_patient_dir_from_autocomplete()
+        organ_title = self.organ.currentText().strip()
+        if locked_patient_dir is not None and organ_title:
+            dynamics_patient_code = build_db_patient_code(
+                organ_title,
+                locked_patient_dir.name,
+            )
+
+        return PatientLookupInput(
+            patient_code=dynamics_patient_code,
+            organ_title=organ_title or None,
+            recipient_code=recipient_code,
+            last_name=self.last_name.text().strip() or None,
+            new_last_name=(
+                self.new_last_name.text().strip() or None
+                if self._is_new_last_name_active()
+                else None
+            ),
+            first_name=self.first_name.text().strip() or None,
+            middle_name=self.middle_name.text().strip() or None,
+            birth_date=self.birth_date.get_date(),
+            sex=self.sex.currentData() if self.sex.currentIndex() >= 0 else None,
+        )
+
+    def _toggle_antibody_dynamics_settings_popup(self) -> None:
+        if self._antibody_dynamics_settings_popup is not None:
+            if self._antibody_dynamics_settings_popup.isVisible():
+                self._antibody_dynamics_settings_popup.close()
+                self._antibody_dynamics_settings_popup = None
+                return
+
+        popup = AntibodyDynamicsSettingsPopup(self)
+        popup.settings_saved.connect(self._on_antibody_dynamics_settings_saved)
+        popup.destroyed.connect(
+            lambda _obj=None: setattr(self, "_antibody_dynamics_settings_popup", None)
+        )
+
+        self._position_antibody_dynamics_settings_popup(popup)
+
+        self._antibody_dynamics_settings_popup = popup
+        popup.show()
+
+    def _position_antibody_dynamics_settings_popup(self, popup: QWidget) -> None:
+        popup.adjustSize()
+        popup_width = popup.width()
+        popup_height = popup.height()
+
+        button_rect = self.btn_antibody_dynamics_settings.rect()
+        button_bottom_left = self.btn_antibody_dynamics_settings.mapToGlobal(
+            button_rect.bottomLeft()
+        )
+        button_bottom_right = self.btn_antibody_dynamics_settings.mapToGlobal(
+            button_rect.bottomRight()
+        )
+        button_top_left = self.btn_antibody_dynamics_settings.mapToGlobal(
+            button_rect.topLeft()
+        )
+
+        screen = QGuiApplication.screenAt(button_bottom_left)
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+
+        available_rect = (
+            screen.availableGeometry() if screen is not None else self.frameGeometry()
+        )
+        main_rect = self.frameGeometry()
+        # Popup должен оставаться в видимой области текущего экрана, но и не
+        # "улетать" далеко от главного окна на multi-monitor раскладках.
+        allowed_rect = available_rect.intersected(main_rect)
+        if (
+            allowed_rect.isNull()
+            or allowed_rect.width() <= 0
+            or allowed_rect.height() <= 0
+        ):
+            allowed_rect = available_rect
+
+        margin = 8
+        min_x = allowed_rect.left() + margin
+        min_y = allowed_rect.top() + margin
+        max_x = allowed_rect.right() - margin - popup_width
+        max_y = allowed_rect.bottom() - margin - popup_height
+
+        x = button_bottom_left.x()
+        y = button_bottom_left.y()
+
+        if x > max_x:
+            x = button_bottom_right.x() - popup_width
+
+        if y > max_y:
+            y = button_top_left.y() - popup_height
+
+        x = min(x, max_x)
+        y = min(y, max_y)
+        x = max(min_x, x)
+        y = max(min_y, y)
+
+        popup.move(x, y)
+
+    def _on_antibody_dynamics_settings_saved(self) -> None:
+        if self._antibody_dynamics_window is not None:
+            self._antibody_dynamics_window.reload_current_patient()
+
+    def _open_antibody_dynamics_window(self) -> None:
+        if not self._ensure_postgres_available_for_dynamics():
+            return
+
+        try:
+            lookup_input = self._build_dynamics_lookup_input()
+            candidates = resolve_primary_patient_for_dynamics(lookup_input)
+        except ValueError as e:
+            self._info_message(str(e))
+            return
+        except Exception as e:
+            self._warn(f"Не удалось найти пациента для динамики антител:\n{e}")
+            return
+
+        if not candidates:
+            self._info_message(
+                "Построение динамики антител для данного пациента невозможно.\n\n"
+                "Ранее антитела не выявлялись. Данные для анализа динамики отсутствуют."
+            )
+            return
+
+        if len(candidates) > 1:
+            dialog = AntibodyDynamicsPatientPickDialog(
+                candidates=candidates,
+                parent=self,
+            )
+            if dialog.exec() != QDialog.Accepted or dialog.selected_candidate is None:
+                return
+            patient_code = dialog.selected_candidate.patient_code
+        else:
+            patient_code = candidates[0].patient_code
+
+        # В рамках одной сессии окно динамики переиспользуется: это сохраняет
+        # пользовательские UI-настройки и не плодит несколько одинаковых окон.
+        if self._antibody_dynamics_window is None:
+            self._antibody_dynamics_window = AntibodyDynamicsWindow(self)
+            self._antibody_dynamics_window.destroyed.connect(
+                lambda _obj=None: setattr(self, "_antibody_dynamics_window", None)
+            )
+
+        self._antibody_dynamics_window.show()
+        self._antibody_dynamics_window.raise_()
+        self._antibody_dynamics_window.activateWindow()
+        self._antibody_dynamics_window.load_patient(patient_code)
+
     def _fill_patient_fields_from_folder(self, parsed) -> None:
         self.last_name.setText(parsed.last_name)
 
@@ -2046,6 +2387,86 @@ class MainWindow(QMainWindow):
 
     # --- Выбор CSV и JPEG/Word-файла заключения,
     # --- а также правила замены и удаления исследования ---
+    def _try_get_current_patient_dir_for_conclusion_delete(self) -> Path | None:
+        if not self._root_dir_available:
+            return None
+
+        organ = self.organ.currentText().strip()
+        test_d = self.test_date.get_date()
+        birth_d = self.birth_date.get_date()
+        sex = self.sex.currentData()
+
+        if not organ or test_d is None or birth_d is None or not sex:
+            return None
+
+        last_name = self.last_name.text().strip() or ""
+        new_last_name = (
+            self.new_last_name.text().strip() if self._is_new_last_name_active() else ""
+        )
+        first_name = self.first_name.text().strip()
+        middle_name = self.middle_name.text().strip() or ""
+
+        if not first_name:
+            return None
+        if not last_name and not new_last_name:
+            return None
+
+        locked_patient_dir = self._get_locked_patient_dir_from_autocomplete()
+        if locked_patient_dir is not None:
+            return locked_patient_dir
+
+        organ_dir = self._effective_root_dir() / organ
+        if not organ_dir.exists():
+            return None
+
+        search = build_patient_folder_search(
+            organ_dir=organ_dir,
+            last_name=last_name,
+            new_last_name=new_last_name,
+            first_name=first_name,
+            middle_name=middle_name,
+            birth_date=birth_d,
+            sex=sex,
+        )
+
+        if search.exact_match_folder is not None:
+            return search.exact_match_folder
+
+        return None
+
+    def _existing_class_file_for_current_test_folder(
+        self, hla_class: int
+    ) -> str | None:
+        patient_dir = self._try_get_current_patient_dir_for_conclusion_delete()
+        test_d = self.test_date.get_date()
+
+        if patient_dir is None or test_d is None:
+            return None
+
+        file_name = class_result_file_name(hla_class)
+        file_path = patient_dir / format_ddmmyyyy(test_d) / file_name
+
+        if file_path.is_file():
+            return file_name
+
+        return None
+
+    def _existing_conclusion_files_for_test_folder(self) -> list[str]:
+        patient_dir = self._try_get_current_patient_dir_for_conclusion_delete()
+        test_d = self.test_date.get_date()
+
+        if patient_dir is None or test_d is None:
+            return []
+
+        test_dir = patient_dir / format_ddmmyyyy(test_d)
+
+        files = []
+        for name in CONCLUSION_FILE_NAMES:
+            if (test_dir / name).is_file():
+                files.append(name)
+
+        return files
+
     def _confirm_delete_checkbox(self, checked: bool, hla_class: int) -> bool:
         if not checked:
             return True
@@ -2088,7 +2509,7 @@ class MainWindow(QMainWindow):
         if not checked:
             return True
 
-        existing_files = self._existing_conclusion_files_for_test_forlder()
+        existing_files = self._existing_conclusion_files_for_test_folder()
 
         if len(existing_files) == 1:
             box = QMessageBox(self)
@@ -2281,86 +2702,6 @@ class MainWindow(QMainWindow):
             or self.chk_delete_study.isChecked()
             or self.chk_delete_concl.isChecked()
         )
-
-    def _try_get_current_patient_dir_for_conclusion_delete(self) -> Path | None:
-        if not self._root_dir_available:
-            return None
-
-        organ = self.organ.currentText().strip()
-        test_d = self.test_date.get_date()
-        birth_d = self.birth_date.get_date()
-        sex = self.sex.currentData()
-
-        if not organ or test_d is None or birth_d is None or not sex:
-            return None
-
-        last_name = self.last_name.text().strip() or ""
-        new_last_name = (
-            self.new_last_name.text().strip() if self._is_new_last_name_active() else ""
-        )
-        first_name = self.first_name.text().strip()
-        middle_name = self.middle_name.text().strip() or ""
-
-        if not first_name:
-            return None
-        if not last_name and not new_last_name:
-            return None
-
-        locked_patient_dir = self._get_locked_patient_dir_from_autocomplete()
-        if locked_patient_dir is not None:
-            return locked_patient_dir
-
-        organ_dir = self._effective_root_dir() / organ
-        if not organ_dir.exists():
-            return None
-
-        search = build_patient_folder_search(
-            organ_dir=organ_dir,
-            last_name=last_name,
-            new_last_name=new_last_name,
-            first_name=first_name,
-            middle_name=middle_name,
-            birth_date=birth_d,
-            sex=sex,
-        )
-
-        if search.exact_match_folder is not None:
-            return search.exact_match_folder
-
-        return None
-
-    def _existing_class_file_for_current_test_folder(
-        self, hla_class: int
-    ) -> str | None:
-        patient_dir = self._try_get_current_patient_dir_for_conclusion_delete()
-        test_d = self.test_date.get_date()
-
-        if patient_dir is None or test_d is None:
-            return None
-
-        file_name = class_result_file_name(hla_class)
-        file_path = patient_dir / format_ddmmyyyy(test_d) / file_name
-
-        if file_path.is_file():
-            return file_name
-
-        return None
-
-    def _existing_conclusion_files_for_test_forlder(self) -> list[str]:
-        patient_dir = self._try_get_current_patient_dir_for_conclusion_delete()
-        test_d = self.test_date.get_date()
-
-        if patient_dir is None or test_d is None:
-            return []
-
-        test_dir = patient_dir / format_ddmmyyyy(test_d)
-
-        files = []
-        for name in CONCLUSION_FILE_NAMES:
-            if (test_dir / name).is_file():
-                files.append(name)
-
-        return files
 
     def _class_xlsx_will_remain_after_planned_actions(
         self,
@@ -2576,15 +2917,6 @@ class MainWindow(QMainWindow):
 
         return True, ""
 
-    def _default_dialog_dir(self) -> str:
-        prefs = load_effective_app_preferences()
-
-        if prefs.dialog_dir is not None:
-            return str(prefs.dialog_dir)
-
-        desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
-        return desktop or str(self._effective_root_dir())
-
     def _default_csv_dialog_dir(self) -> str:
         prefs = load_effective_app_preferences()
 
@@ -2775,11 +3107,11 @@ class MainWindow(QMainWindow):
             )
             return
 
-        min_titer_text = (self.ed_avg_min_titer.text() or "").strip()
-        min_titer = int(min_titer_text) if min_titer_text else DEFAULT_AVG_MIN_TITER
-
         try:
-            result = build_avg_excels(csv_paths, min_titer=min_titer)
+            result = build_avg_excels(
+                csv_paths,
+                min_titer=self.ed_avg_min_titer.effective_value(),
+            )
         except Exception as e:
             self._err(f"Не удалось вычислить:\n{e}")
             return
@@ -3140,8 +3472,10 @@ class MainWindow(QMainWindow):
             return False, "Дата рождения: " + msg
 
         recipient_code_text = self.recipient_code.text().strip()
-        if recipient_code_text and not recipient_code_text.isdigit():
-            return False, "Код реципиента: только цифры"
+        if recipient_code_text and not is_positive_int_text_without_leading_zero(
+            recipient_code_text
+        ):
+            return False, "Код реципиента: только цифры, без начального 0"
 
         if self.chk_delete_study.isChecked() and (
             self.class1_path or self.class2_path or self.conclusion_file_path
@@ -3732,6 +4066,7 @@ class MainWindow(QMainWindow):
         created_patient_dir = False
         selected_patient_dir: Path | None = None
         write_lock_cm = None
+        critical_file_ui_prepared = False
 
         self._begin_import_busy_state("⏳ Выполняется подключение к файловой базе...")
 
@@ -3954,6 +4289,14 @@ class MainWindow(QMainWindow):
 
             if not self._ask_password(title="Подтверждение выполнения операции"):
                 return
+
+            if not self._prepare_ui_for_critical_file_operation():
+                self._warn(
+                    "Не удалось подготовить интерфейс к критичной файловой операции.\n\n"
+                    "Закройте активные всплывающие окна и повторите попытку."
+                )
+                return
+            critical_file_ui_prepared = True
 
             self.status.setText("⏳ Выполняется обработка исследования...")
             self._process_non_input_events()
@@ -4182,7 +4525,11 @@ class MainWindow(QMainWindow):
                 if write_lock_cm is not None:
                     write_lock_cm.__exit__(None, None, None)
             finally:
-                self._end_import_busy_state()
+                try:
+                    if critical_file_ui_prepared:
+                        self._restore_ui_after_critical_file_operation()
+                finally:
+                    self._end_import_busy_state()
 
             if final_status is not None:
                 self.status.setText(final_status)

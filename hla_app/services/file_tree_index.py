@@ -16,12 +16,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 
+from hla_app.utils.validators import normalize_for_match
+
 # --- Структура результата поиска по локальному индексу ---
 
 
 @dataclass(frozen=True)
 class FileTreeIndexHit:
     path: Path
+    is_dir: bool
 
 
 # --- Сервис построения и чтения локального SQLite-индекса ---
@@ -36,7 +39,7 @@ class FileTreeIndexService:
     Это важно, чтобы во время перестроения не испортить рабочий индекс.
     """
 
-    SCHEMA_VERSION = "1"
+    SCHEMA_VERSION = "2"
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -59,14 +62,15 @@ class FileTreeIndexService:
         conn.execute("""--sql
             CREATE TABLE IF NOT EXISTS
                 entries (
-                    path TEXT PRIMARY KEY,
+                    PATH TEXT PRIMARY KEY,
                     parent_path TEXT NOT NULL,
                     rel_path TEXT NOT NULL,
-                    name TEXT NOT NULL,
+                    NAME TEXT NOT NULL,
                     name_folded TEXT NOT NULL,
+                    name_match TEXT NOT NULL,
                     is_dir INTEGER NOT NULL
                 )
-            """)
+        """)
         conn.execute("""--sql
             CREATE INDEX IF NOT EXISTS ix_entries_parent_path ON entries (parent_path)
             """)
@@ -74,9 +78,12 @@ class FileTreeIndexService:
             CREATE INDEX IF NOT EXISTS ix_entries_name_folded ON entries (name_folded)
             """)
         conn.execute("""--sql
+            CREATE INDEX IF NOT EXISTS ix_entries_name_match ON entries (name_match)
+            """)
+        conn.execute("""--sql
             CREATE TABLE IF NOT EXISTS
                 meta (KEY TEXT PRIMARY KEY, VALUE TEXT NOT NULL)
-            """)
+        """)
         conn.commit()
 
     def _normalize_path(self, path: Path | str) -> Path:
@@ -161,7 +168,7 @@ class FileTreeIndexService:
 
         entry_count = 0
         skipped_dir_count = 0
-        batch: list[tuple[str, str, str, str, str, int]] = []
+        batch: list[tuple[str, str, str, str, str, str, int]] = []
 
         def flush_batch(conn: sqlite3.Connection) -> None:
             nonlocal batch
@@ -172,15 +179,16 @@ class FileTreeIndexService:
                 """--sql
                 INSERT INTO
                     entries (
-                        path,
+                        PATH,
                         parent_path,
                         rel_path,
-                        name,
+                        NAME,
                         name_folded,
+                        name_match,
                         is_dir
                     )
                 VALUES
-                    (?, ?, ?, ?, ?, ?)
+                    (?, ?, ?, ?, ?, ?, ?)
                 """,
                 batch,
             )
@@ -201,6 +209,7 @@ class FileTreeIndexService:
                     "",
                     root_name,
                     root_name.casefold(),
+                    normalize_for_match(root_name, strict_first_char=True),
                     1,
                 )
             )
@@ -235,6 +244,10 @@ class FileTreeIndexService:
                                     rel_path,
                                     entry.name,
                                     entry.name.casefold(),
+                                    normalize_for_match(
+                                        entry.name,
+                                        strict_first_char=True,
+                                    ),
                                     1 if is_dir else 0,
                                 )
                             )
@@ -302,34 +315,47 @@ class FileTreeIndexService:
 
         base_dir_text = str(base_dir)
         base_dir_prefix = base_dir_text + os.sep
-        query_like = "%" + self._escape_like(query.casefold()) + "%"
+        query_folded = query.casefold()
+        query_match = normalize_for_match(query, strict_first_char=True)
+        query_like = "%" + self._escape_like(query_folded) + "%"
+        query_match_like = (
+            "%" + self._escape_like(query_match) + "%" if query_match else None
+        )
+        name_match_clause = "name_folded LIKE ? ESCAPE '\\'"
+        params: list[object] = [query_like]
+        if query_match_like is not None:
+            name_match_clause = (
+                "(name_folded LIKE ? ESCAPE '\\' OR name_match LIKE ? ESCAPE '\\')"
+            )
+            params.append(query_match_like)
+
+        params.extend([base_dir_text, base_dir_prefix + "%", int(limit)])
+        sql = f"""--sql
+            SELECT
+                PATH,
+                is_dir
+            FROM
+                entries
+            WHERE
+                {name_match_clause}
+                AND (
+                    PATH = ?
+                    OR PATH LIKE ?
+                )
+            ORDER BY
+                is_dir DESC,
+                NAME COLLATE NOCASE ASC,
+                rel_path COLLATE NOCASE ASC
+            LIMIT
+                ?
+        """
 
         with self._lock:
             with closing(self._connect(self.db_path)) as conn:
-                rows = conn.execute(
-                    """--sql
-                    SELECT
-                        path
-                    FROM
-                        entries
-                    WHERE
-                        name_folded LIKE ? ESCAPE '\\'
-                        AND (
-                            path = ?
-                            OR path LIKE ?
-                        )
-                    ORDER BY
-                        is_dir DESC,
-                        name COLLATE NOCASE ASC,
-                        rel_path COLLATE NOCASE ASC
-                    LIMIT
-                        ?
-                    """,
-                    (query_like, base_dir_text, base_dir_prefix + "%", int(limit)),
-                ).fetchall()
+                rows = conn.execute(sql, params).fetchall()
 
         return [
-            FileTreeIndexHit(path=Path(row["path"]))
+            FileTreeIndexHit(path=Path(row["path"]), is_dir=bool(row["is_dir"]))
             for row in rows
             if not self._is_source_files_path(
                 root_dir=root_dir,
