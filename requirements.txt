@@ -1,0 +1,26 @@
+# python.exe -m pip install --upgrade pip
+
+# UI
+PySide6
+pyqtgraph
+
+# Database
+SQLAlchemy
+psycopg2-binary
+pyodbc
+PyMySQL
+oracledb
+
+# Data processing
+pandas
+
+# Reports
+openpyxl
+python-docx
+pywin32
+
+# Recommended build command:
+# pip install --upgrade --upgrade-strategy eager -r requirements.txt
+
+# .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --noupx --icon assets\app.ico --version-file version_info.txt --add-data "assets;assets" --add-data "licenses;licenses" --add-data "Scripts;Scripts" --add-data "THIRD_PARTY_LICENSES.txt;." --add-data "LICENSE.txt;." --add-data "COPYRIGHT.txt;." --add-data "AUTHORS.md;." --add-data "README.md;." --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32com.client --hidden-import win32clipboard --hidden-import winerror --hidden-import win32comext.shell.shell --hidden-import win32comext.shell.shellcon --hidden-import pyodbc --hidden-import pymysql --hidden-import oracledb --hidden-import sqlalchemy.dialects.mssql.pyodbc --hidden-import sqlalchemy.dialects.postgresql.psycopg2 --hidden-import sqlalchemy.dialects.mysql.pymysql --hidden-import sqlalchemy.dialects.oracle.oracledb --collect-all pyqtgraph --name HLA_Laboratory_System main.py
+pyinstaller

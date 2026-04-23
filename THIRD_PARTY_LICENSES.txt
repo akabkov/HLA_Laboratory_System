@@ -1,0 +1,241 @@
+THIRD-PARTY SOFTWARE NOTICES
+for HLA Laboratory System 1.0.3
+
+This product uses third-party software components.
+This notice file is based on the installed Windows runtime/build environment
+reviewed on 2026-04-23. Refresh this file before every public release or
+binary bundle, especially because requirements.txt does not pin exact package
+versions.
+
+Runtime dependencies intended for redistribution
+-----------------------------------------------
+
+1) Qt for Python runtime
+   Packages:
+   - PySide6 6.11.0
+   - PySide6_Essentials 6.11.0
+   - PySide6_Addons 6.11.0
+   - shiboken6 6.11.0
+   Installed wheel metadata declares:
+   - LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+   This project is intended to be distributed under the LGPLv3 route for the
+   Qt for Python runtime, unless a separate commercial Qt license is obtained
+   and used for a specific release.
+   Bundle with distribution:
+   - licenses/LGPL-3.0.txt
+   - licenses/GPL-2.0.txt
+   - licenses/GPL-3.0.txt
+   - licenses/Qt-Licensing-Note.txt
+   - licenses/Qt-Commercial-Reference.txt
+   IMPORTANT:
+   Qt for Python documentation recommends acknowledging the applicable
+   third-party notices for the exact Qt/PySide6 modules used by your build.
+   If you change the PySide6 version or the set of Qt modules, review and
+   refresh the bundled notices before release.
+   For a proprietary binary release under the LGPLv3 route, keep the Qt/PySide6
+   libraries replaceable in the distributed bundle and do not restrict the
+   user's LGPL rights for those components. If that is not suitable for a
+   particular release, use a valid commercial Qt license instead.
+
+2) pyqtgraph 0.14.0
+   License: MIT License
+   Purpose in this project:
+   - Interactive plotting for the antibody dynamics window.
+   Bundle with distribution:
+   - licenses/pyqtgraph-MIT.txt
+
+3) colorama 0.4.6
+   License: BSD 3-Clause License
+   Purpose in this project:
+   - Installed runtime dependency of pyqtgraph.
+   Bundle with distribution:
+   - licenses/colorama-LICENSE.txt
+
+4) psycopg2-binary 2.9.12
+   License: LGPL with exceptions
+   The Windows binary wheel also bundles native runtime libraries such as:
+   - libpq (PostgreSQL client library)
+   - OpenSSL runtime libraries
+   Bundle with distribution:
+   - licenses/psycopg2-binary-LGPL-with-exceptions.txt
+   - licenses/PostgreSQL-License.txt
+   - licenses/Apache-2.0.txt
+
+5) SQLAlchemy 2.0.49
+   License: MIT License
+   Bundle with distribution:
+   - licenses/SQLAlchemy-MIT.txt
+
+6) greenlet 3.4.0
+   License: MIT AND PSF-2.0
+   Purpose in this project:
+   - Installed runtime dependency used by SQLAlchemy on this platform.
+   Bundle with distribution:
+   - licenses/greenlet-LICENSE.txt
+   - licenses/greenlet-LICENSE.PSF.txt
+
+7) pandas 3.0.2
+   License: BSD 3-Clause License
+   Bundle with distribution:
+   - licenses/pandas-BSD-3-Clause.txt
+
+8) numpy 2.4.4
+   License expression from wheel metadata:
+   - BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
+   The wheel includes bundled third-party notices.
+   Bundle with distribution:
+   - licenses/numpy-LICENSE.txt
+
+9) python-dateutil 2.9.0.post0
+   License: dual-license notice (BSD + Apache-2.0 re-licensed portions)
+   Bundle with distribution:
+   - licenses/python-dateutil-LICENSE.txt
+
+10) tzdata 2026.1
+    License: Apache License 2.0
+    Bundle with distribution:
+    - licenses/Apache-2.0.txt
+
+11) openpyxl 3.1.5
+    License: MIT License
+    Bundle with distribution:
+    - licenses/openpyxl-MIT.txt
+
+12) et_xmlfile 2.0.0
+    License: MIT License
+    Bundle with distribution:
+    - licenses/et_xmlfile-MIT.txt
+
+13) python-docx 1.2.0
+    License: MIT License
+    Bundle with distribution:
+    - licenses/python-docx-MIT.txt
+
+14) lxml 6.1.0
+    License: BSD 3-Clause License
+    Additional upstream notices are included by the wheel for bundled or
+    referenced components.
+    Bundle with distribution:
+    - licenses/lxml-BSD-3-Clause.txt
+    - licenses/lxml-additional-notices.txt
+
+15) six 1.17.0
+    License: MIT License
+    Bundle with distribution:
+    - licenses/six-MIT.txt
+
+16) pywin32 311
+    Package metadata declares: Python Software Foundation License (PSF)
+    The installed wheel also ships BSD-style notices for win32 and win32com
+    components used by this project.
+    Purpose in this project:
+    - Windows COM integration for conversion of Word conclusion files
+      (`.doc` / `.docx`) into PDF during import.
+    Bundle with distribution:
+    - licenses/pywin32-LICENSE.txt
+    - licenses/pywin32-Licensing-Note.txt
+    Notes:
+    - pywin32 is a Windows-only dependency.
+    - Before preparing a release bundle, verify the exact upstream license
+      texts and notices that correspond to the pywin32 wheel/source tree used
+      for that release.
+
+17) pyodbc 5.3.0
+    License: MIT License
+    Purpose in this project:
+    - Optional ODBC connection to a remote patient passport data source.
+    Bundle with distribution:
+    - licenses/pyodbc-MIT.txt
+    Notes:
+    - System ODBC drivers, such as Microsoft SQL Server ODBC drivers, are not
+      bundled by this project unless explicitly added to a separate release
+      package. If such drivers are redistributed, review their separate
+      license terms and notices.
+
+18) PyMySQL 1.1.2
+    License: MIT License
+    Purpose in this project:
+    - Optional MySQL/MariaDB connection to a remote patient passport data
+      source.
+    Bundle with distribution:
+    - licenses/PyMySQL-MIT.txt
+
+19) python-oracledb 3.4.2
+    Package name: oracledb
+    License expression from wheel metadata:
+    - UPL-1.0 OR Apache-2.0
+    Purpose in this project:
+    - Optional Oracle Database connection to a remote patient passport data
+      source.
+    Bundle with distribution:
+    - licenses/python-oracledb-LICENSE.txt
+    - licenses/python-oracledb-NOTICE.txt
+    - licenses/python-oracledb-THIRD_PARTY_LICENSES.txt
+    Notes:
+    - python-oracledb runs in Thin mode without Oracle Client libraries by
+      default. If a release enables Thick mode or redistributes Oracle Client
+      libraries, review their separate Oracle license terms and notices.
+
+20) cryptography 46.0.7
+    License expression from wheel metadata:
+    - Apache-2.0 OR BSD-3-Clause
+    Purpose in this project:
+    - Installed runtime dependency of python-oracledb.
+    Bundle with distribution:
+    - licenses/cryptography-LICENSE.txt
+    - licenses/cryptography-LICENSE.APACHE.txt
+    - licenses/cryptography-LICENSE.BSD.txt
+
+21) cffi 2.0.0
+    License: MIT No Attribution / MIT-0 style notice in upstream LICENSE
+    Purpose in this project:
+    - Installed runtime dependency used by cryptography.
+    Bundle with distribution:
+    - licenses/cffi-LICENSE.txt
+    - licenses/cffi-AUTHORS.txt
+
+22) pycparser 3.0
+    License: BSD 3-Clause License
+    Purpose in this project:
+    - Installed runtime dependency used by cffi.
+    Bundle with distribution:
+    - licenses/pycparser-LICENSE.txt
+
+23) typing_extensions 4.15.0
+    License: PSF-2.0
+    Purpose in this project:
+    - Installed runtime dependency of python-oracledb on this platform.
+    Bundle with distribution:
+    - licenses/typing_extensions-LICENSE.txt
+
+Build-time tools and generated bundle
+-------------------------------------
+
+PyInstaller 6.19.0 is used to create the Windows executable bundle.
+PyInstaller itself is a build tool, but its bootloader and runtime hooks may be
+embedded into the generated executable/bundle.
+
+Installed PyInstaller metadata declares:
+- GPLv2-or-later with a special exception which allows use of PyInstaller to
+  build and distribute non-free programs, including commercial programs.
+
+Bundle with distribution:
+- licenses/PyInstaller-COPYING.txt
+
+Related build helper packages installed in the build environment, such as
+altgraph, packaging, pefile, pyinstaller-hooks-contrib, pywin32-ctypes and
+setuptools, are not intended to be redistributed as separate runtime
+components of the application bundle. If you redistribute the build environment
+or any of those packages themselves, review and include their separate license
+terms and notices.
+
+Practical rule
+--------------
+Always distribute this file together with:
+- COPYRIGHT.txt
+- LICENSE.txt
+- the entire licenses/ folder
+
+If a dependency version, wheel, build mode or bundled driver/client changes,
+refresh this file and the copied license texts from the exact artifacts used
+for that release.
